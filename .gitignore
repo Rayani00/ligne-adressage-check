@@ -1,0 +1,6 @@
+# Secrets — ne jamais committer
+script.env
+.env
+
+# Configuration locale Claude Code
+.claude/
