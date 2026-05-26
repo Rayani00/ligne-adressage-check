@@ -1,0 +1,4 @@
+# Force LF endings for shell scripts so they remain executable on Linux/macOS
+# even when committed from Windows (where autocrlf can otherwise inject CRLF
+# and break the shebang line).
+*.sh text eol=lf

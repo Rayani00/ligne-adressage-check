@@ -12,14 +12,14 @@ Le script déduit automatiquement l'environnement (`uat`, `pre`, `prd`) et le PA
 Deux modes d'exécution :
 
 - **Mono-SIREN** — sortie console (DEBUG ou ERROR_ONLY).
-- **Batch** (PowerShell uniquement) — entrée multi-SIRENs (fichier ou liste CLI) et génération d'un **rapport Markdown** incluant l'URL et le payload de chaque requête HTTP effectuée (secrets redactés).
+- **Batch** — entrée multi-SIRENs (fichier ou liste CLI) et génération d'un **rapport Markdown** incluant l'URL et le payload de chaque requête HTTP effectuée (secrets redactés). Disponible sur les deux versions (PowerShell et Bash).
 
 ## Contenu du dépôt
 
 | Fichier                 | Description                                                        |
 |-------------------------|--------------------------------------------------------------------|
 | `ligne_full_check.ps1`  | Version Windows / PowerShell (aucune dépendance externe). Supporte le mode batch + rapport Markdown. |
-| `ligne_full_check.sh`   | Version Bash / Linux (mono-SIREN, requiert `curl`, `jq`, `base32`, `xmllint`, `openssl`, `dig`). |
+| `ligne_full_check.sh`   | Version Bash / Linux (requiert `curl`, `jq`, `base32`, `xmllint`, `openssl`, `dig`). Supporte le mode batch + rapport Markdown. |
 | `run.cmd`               | Lanceur Windows interactif pour le script PowerShell (mono-SIREN). |
 | `script.env.example`    | Modèle de configuration des secrets.                               |
 
@@ -65,7 +65,7 @@ Le second argument contrôle le mode d'affichage :
 - `true` (défaut) — mode DEBUG, affiche toutes les informations ;
 - `false` — mode ERROR_ONLY, n'affiche que les erreurs.
 
-### Mode batch (PowerShell uniquement)
+### Mode batch
 
 Préparez une liste de SIRENs dans un fichier texte, une ligne par SIREN. Le
 script tolère les formats bruités :
@@ -77,6 +77,8 @@ script tolère les formats bruités :
 
 Doublons dédupliqués automatiquement. Lignes non reconnues listées en fin
 d'exécution.
+
+**Windows (PowerShell)** :
 
 ```powershell
 # Avec fichier d'entrée
@@ -94,6 +96,23 @@ Si `-ExecutionPolicy` est restrictive :
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\ligne_full_check.ps1 -InputFile .\sirens.txt -OutputMarkdown .\rapport.md
 ```
+
+**Linux / macOS (Bash)** :
+
+```sh
+# Avec fichier d'entrée
+./ligne_full_check.sh -i sirens.txt -o rapport.md
+
+# Avec liste CLI
+./ligne_full_check.sh -s 391282597_TESTPILOTE,534980537_TESTPILOTE -o rapport.md
+
+# Avec nom de rapport horodaté
+./ligne_full_check.sh -i sirens.txt -o "rapport_$(date +%Y%m%d_%H%M).md"
+```
+
+Les options longues `--input-file`, `--sirens`, `--output-markdown` sont aussi
+acceptées. `script.env` est chargé automatiquement s'il se trouve à côté du
+script (`source ./script.env` reste possible).
 
 ### Contenu du rapport Markdown
 
