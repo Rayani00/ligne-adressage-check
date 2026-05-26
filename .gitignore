@@ -4,3 +4,9 @@ script.env
 
 # Configuration locale Claude Code
 .claude/
+
+# Données locales et rapports générés par le script (peuvent contenir des SIRENs,
+# URLs internes, identifiants d'environnement — à garder hors du dépôt public)
+sirens.txt
+rapport.md
+rapport_*.md

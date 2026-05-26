@@ -5,20 +5,32 @@
 #
 # Verifie peppol, Harmony-connector et legalRef pour un SIREN_SUFIX donne.
 #
-# Usage :
-#   .\ligne_full_check.ps1 432526903_TESTPILOTE          # mode DEBUG (defaut)
-#   .\ligne_full_check.ps1 432526903_TESTPILOTE false    # mode ERROR_ONLY
+# Mode mono-SIREN (sortie console) :
+#   .\ligne_full_check.ps1 432526903_TESTPILOTE             # mode DEBUG (defaut)
+#   .\ligne_full_check.ps1 432526903_TESTPILOTE false       # mode ERROR_ONLY
+#
+# Mode batch (rapport markdown) :
+#   .\ligne_full_check.ps1 -InputFile sirens.txt -OutputMarkdown rapport.md
+#   .\ligne_full_check.ps1 -Sirens 123_TEST,456_TEST -OutputMarkdown rapport.md
+#
+# Le fichier d'entree accepte une ligne par SIREN. Les lignes vides, commentaires
+# (#) et formats bruites (texte autour, parentheses de fin, espaces internes) sont
+# tolerees : la regex extrait le pattern SIREN_SUFIX automatiquement.
 #
 # Les secrets sont charges automatiquement depuis script.env (meme dossier).
 # Une variable deja definie dans l'environnement du processus n'est pas ecrasee.
 #############################################################################
 
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
+    [Parameter(Position = 0)]
     [string]$Siren,
 
     [Parameter(Position = 1)]
-    [string]$DebugMode = 'true'
+    [string]$DebugMode = 'true',
+
+    [string]$InputFile,
+    [string]$OutputMarkdown,
+    [string[]]$Sirens
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,18 +50,23 @@ trap {
 
 $ShowDebug = ($DebugMode -eq 'true')
 
+# Mode batch si -InputFile, -OutputMarkdown ou -Sirens fourni
+$BatchMode = (-not [string]::IsNullOrWhiteSpace($InputFile)) `
+             -or (-not [string]::IsNullOrWhiteSpace($OutputMarkdown)) `
+             -or ($Sirens -and $Sirens.Count -gt 0)
+
 #############################################################################
 # Fonctions utilitaires
 #############################################################################
 
 function Write-Log {
     param([string]$Message)
-    if ($ShowDebug) { Write-Host "`n$Message" -ForegroundColor Cyan }
+    if ($ShowDebug -and -not $BatchMode) { Write-Host "`n$Message" -ForegroundColor Cyan }
 }
 
 function Write-Json {
     param($Data)
-    if ($ShowDebug) { Write-Host ($Data | ConvertTo-Json -Depth 20) }
+    if ($ShowDebug -and -not $BatchMode) { Write-Host ($Data | ConvertTo-Json -Depth 20) }
 }
 
 function Write-Err {
@@ -153,6 +170,401 @@ function Get-AccessToken {
     return $resp.access_token
 }
 
+# Nettoie une ligne d'entree (parens de fin, espaces internes, texte parasite)
+# et renvoie le SIREN_SUFIX si trouve, sinon $null.
+function Get-CleanSiren {
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    $t = $Line.Trim()
+    if ($t.StartsWith('#')) { return $null }
+    # Strip trailing parenthesised label (ex : "... (Delpeyrat)")
+    $t = $t -replace '\s*\([^)]*\)\s*$', ''
+    # Match \d{9,10}\s*_<non-space-suite>, tolere un espace parasite avant _
+    if ($t -match '(\d{9,10})\s*_(\S+)') {
+        return $Matches[1] + '_' + $Matches[2]
+    }
+    return $null
+}
+
+# Formate une liste de requetes HTTP capturees en markdown (puces + sous-puces).
+function Format-Requests {
+    param($Requests)
+    if (-not $Requests -or $Requests.Count -eq 0) { return $null }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($req in $Requests) {
+        $label = if ($req.Label) { "**$($req.Label)** : " } else { '' }
+        [void]$lines.Add("- $label``$($req.Method) $($req.Url)``")
+        if ($req.Body)   { [void]$lines.Add("  - body : ``$($req.Body)``") }
+        if ($req.Header) { [void]$lines.Add("  - header : ``$($req.Header)``") }
+    }
+    return ($lines -join "`n")
+}
+
+#############################################################################
+# Coeur du check pour un SIREN (renvoie un objet structure)
+#############################################################################
+
+function Invoke-LigneCheck {
+    param([string]$TargetSiren)
+
+    $result = [ordered]@{
+        Siren     = $TargetSiren
+        Peppol    = [ordered]@{ Status = 'NOT_RUN'; Data = $null; Error = $null; Requests = (New-Object System.Collections.ArrayList) }
+        Inference = [ordered]@{ Status = 'NOT_RUN'; Data = $null; Error = $null }
+        Harmony   = [ordered]@{ Status = 'NOT_RUN'; Url = $null; Data = $null; Error = $null; Requests = (New-Object System.Collections.ArrayList) }
+        LegalRef  = [ordered]@{ Status = 'NOT_RUN'; SubDomain = $null; Data = $null; Error = $null; Requests = (New-Object System.Collections.ArrayList) }
+    }
+
+    $scheme      = 'iso6523-actorid-upis'
+    $participant = "0225:$TargetSiren"
+
+    # ----- Peppol -----
+    $apUrl = $null
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($participant.ToLowerInvariant()))
+        } finally {
+            $sha.Dispose()
+        }
+        $hash    = (ConvertTo-Base32 $hashBytes).ToLowerInvariant().Replace('=', '')
+        $dnsName = "$hash.$scheme.participant.sml.test.tech.peppol.org"
+
+        [void]$result.Peppol.Requests.Add([ordered]@{
+            Label = 'DNS NAPTR (DNS-over-HTTPS)'
+            Method = 'GET'
+            Url = "https://dns.google/resolve?name=$dnsName&type=35"
+        })
+        $smpUrl = Get-PeppolSmpUrl $dnsName
+        if ([string]::IsNullOrWhiteSpace($smpUrl)) {
+            throw "No Meta:SMP record found for `"$participant`""
+        }
+
+        $smpEndpoint = "$smpUrl/$scheme::$participant"
+        [void]$result.Peppol.Requests.Add([ordered]@{
+            Label = 'SMP racine'
+            Method = 'GET'
+            Url = $smpEndpoint
+        })
+        [xml]$smpXml = (Invoke-WebRequest -Uri $smpEndpoint -UseBasicParsing).Content
+        $refNodes  = $smpXml.SelectNodes("//*[local-name()='ServiceMetadataReference']")
+        $docNumber = $refNodes.Count
+        if ($docNumber -lt 1) {
+            throw "No ServiceMetadataReference found for `"$participant`""
+        }
+        $firstDoc = $refNodes[0].GetAttribute('href')
+
+        [void]$result.Peppol.Requests.Add([ordered]@{
+            Label = 'SMP doc'
+            Method = 'GET'
+            Url = $firstDoc
+        })
+        [xml]$firstDocXml = (Invoke-WebRequest -Uri $firstDoc -UseBasicParsing).Content
+        $apUrl          = Get-XmlText $firstDocXml "//*[local-name()='EndpointReference']/*[local-name()='Address']"
+        $smpCertificate = Get-XmlText $firstDocXml "//*[local-name()='X509SubjectName']"
+        $certB64        = Get-XmlText $firstDocXml "//*[local-name()='Certificate']"
+
+        $apCertSubject = ''
+        if ($certB64 -ne '') {
+            $certBytes = [Convert]::FromBase64String(($certB64 -replace '\s', ''))
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(, $certBytes)
+            $apCertSubject = $cert.Subject
+        }
+
+        $result.Peppol.Status = 'OK'
+        $result.Peppol.Data = [ordered]@{
+            SMP_URL                = $smpUrl
+            SMP_CERTIFICATE        = $smpCertificate
+            DOC_NUMBER             = $docNumber
+            AP_URL                 = $apUrl
+            AP_CERTIFICATE_SUBJECT = $apCertSubject
+        }
+    } catch {
+        $result.Peppol.Status = 'ERROR'
+        $result.Peppol.Error  = $_.Exception.Message
+        return $result
+    }
+
+    # ----- Inference ENV / PA -----
+    $envName = $null
+    $pa      = $null
+    try {
+        $tmp       = $apUrl -replace '^https://', ''
+        $subDomain = ($tmp -split '/', 2)[0]
+        $dotIdx    = $subDomain.IndexOf('.')
+        $domain    = if ($dotIdx -ge 0) { $subDomain.Substring($dotIdx + 1) } else { $subDomain }
+
+        if ($tmp.Contains('/')) {
+            $urlPath = '/' + $tmp.Substring($tmp.IndexOf('/') + 1)
+        } else {
+            $urlPath = '/' + $tmp
+        }
+
+        $envName = $apUrl -replace '^https://gis-platform-', ''
+        $envName = ($envName -split '\.', 2)[0]
+
+        switch ($domain) {
+            'generix.biz'             { $pa = 'gnx' }
+            'fulll.house'             { $pa = 'fulll' }
+            'pbis.qa-mypbconnect.com' { $pa = 'pitney-bowes' }
+            'treso2.com'              { $pa = 'pytheas' }
+            default { throw "Unknown domain: `"$domain`"" }
+        }
+
+        $firstLevel = $urlPath -replace '/harmonypdpap/services/msh$', ''
+        if ($firstLevel -ne '') {
+            $pa = $firstLevel -replace '^/', ''
+        }
+
+        $result.Inference.Status = 'OK'
+        $result.Inference.Data = [ordered]@{
+            ENV        = $envName
+            SUB_DOMAIN = $subDomain
+            DOMAIN     = $domain
+            PA         = $pa
+        }
+    } catch {
+        $result.Inference.Status = 'ERROR'
+        $result.Inference.Error  = $_.Exception.Message
+        return $result
+    }
+
+    # ----- Harmony-connector -----
+    $harmonyConnectorUrl = "$pa-harmonyconnector-fr-$envName.apps.prd.openshift.vmwr/$pa"
+    $result.Harmony.Url  = $harmonyConnectorUrl
+    try {
+        [void]$result.Harmony.Requests.Add([ordered]@{
+            Label = 'Token Keycloak'
+            Method = 'POST'
+            Url = 'https://auth.apps.generix.biz/auth/realms/bo-generix/protocol/openid-connect/token'
+            Body = 'grant_type=client_credentials&client_id=$env:HARMONY_CONNECTOR_CLIENT_ID&client_secret=***'
+        })
+        $harmonyToken = Get-AccessToken $env:HARMONY_CONNECTOR_CLIENT_ID $env:HARMONY_CONNECTOR_CLIENT_SECRET
+        $harmonyEndpoint = "https://$harmonyConnectorUrl/harmonyconnector-fr/v1/participants/$participant"
+        [void]$result.Harmony.Requests.Add([ordered]@{
+            Label = 'Routing'
+            Method = 'GET'
+            Url = $harmonyEndpoint
+            Header = 'Authorization: Bearer <token>'
+        })
+        $routing = Invoke-RestMethod -Uri $harmonyEndpoint -Headers @{
+            Accept        = 'application/json'
+            Authorization = "Bearer $harmonyToken"
+        }
+        $result.Harmony.Status = 'OK'
+        $result.Harmony.Data   = $routing
+    } catch {
+        $result.Harmony.Status = 'ERROR'
+        $result.Harmony.Error  = $_.Exception.Message
+    }
+
+    # ----- legalRef -----
+    $legalRefSubDomain = $null
+    switch ("${envName}:${pa}") {
+        'uat:gnx'          { $legalRefSubDomain = 'legalref-api-uat-ppd.staging.apps.generix.biz'; break }
+        'uat:pitney-bowes' { $legalRefSubDomain = 'legalref-api-uat-pitneybowes.staging.apps.generix.biz'; break }
+        'uat:fulll'        { $legalRefSubDomain = 'N/A'; break }
+        'uat:pytheas'      { $legalRefSubDomain = 'N/A'; break }
+        'uat:b4value'      { $legalRefSubDomain = 'N/A'; break }
+        'uat:fiteco'       { $legalRefSubDomain = 'N/A'; break }
+        'uat:spendesk'     { $legalRefSubDomain = 'N/A'; break }
+        'pre:gnx'          { $legalRefSubDomain = 'legalref-api-ppd.staging.apps.generix.biz'; break }
+        'pre:fulll'        { $legalRefSubDomain = 'legalref-api-pprd-fulll.staging.apps.generix.biz'; break }
+        'pre:pitney-bowes' { $legalRefSubDomain = 'legalref-api-pprd-pitneybowes.staging.apps.generix.biz'; break }
+        'pre:pytheas'      { $legalRefSubDomain = 'legalref-api-pprd-pytheas.staging.apps.generix.biz'; break }
+        'pre:b4value'      { $legalRefSubDomain = 'legalref-api-pprd-b4value.staging.apps.generix.biz'; break }
+        'pre:fiteco'       { $legalRefSubDomain = 'legalref-api-pprd-fiteco.staging.apps.generix.biz'; break }
+        'pre:spendesk'     { $legalRefSubDomain = 'legalref-api-pprd-spendesk.staging.apps.generix.biz'; break }
+        'prd:gnx'          { $legalRefSubDomain = 'legalref-api.apps.generix.biz'; break }
+        'prd:fulll'        { $legalRefSubDomain = 'legalref-api-fulll.apps.generix.biz'; break }
+        'prd:pitney-bowes' { $legalRefSubDomain = 'legalref-api-pitneybowes.apps.generix.biz'; break }
+        'prd:pytheas'      { $legalRefSubDomain = 'legalref-api-pytheas.apps.generix.biz'; break }
+        'prd:b4value'      { $legalRefSubDomain = 'legalref-api-b4value.apps.generix.biz'; break }
+        'prd:fiteco'       { $legalRefSubDomain = 'legalref-api-fiteco.apps.generix.biz'; break }
+        'prd:spendesk'     { $legalRefSubDomain = 'legalref-api-spendesk.apps.generix.biz'; break }
+        default {
+            $result.LegalRef.Status = 'ERROR'
+            $result.LegalRef.Error  = "Unsupported ENV/PA combination: `"$envName/$pa`""
+            return $result
+        }
+    }
+
+    $result.LegalRef.SubDomain = $legalRefSubDomain
+
+    if ($legalRefSubDomain -eq 'N/A') {
+        $result.LegalRef.Status = 'N/A'
+        return $result
+    }
+
+    try {
+        [void]$result.LegalRef.Requests.Add([ordered]@{
+            Label = 'Token Keycloak'
+            Method = 'POST'
+            Url = 'https://auth.apps.generix.biz/auth/realms/bo-generix/protocol/openid-connect/token'
+            Body = 'grant_type=client_credentials&client_id=$env:LEGALREF_CLIENT_ID&client_secret=***'
+        })
+        $legalRefToken = Get-AccessToken $env:LEGALREF_CLIENT_ID $env:LEGALREF_CLIENT_SECRET
+        $legalRefEndpoint = "https://$legalRefSubDomain/ppf/annuaire-public/v2/ligne-annuaire/code:$TargetSiren"
+        [void]$result.LegalRef.Requests.Add([ordered]@{
+            Label = 'Ligne annuaire'
+            Method = 'GET'
+            Url = $legalRefEndpoint
+            Header = 'Authorization: Bearer <token>'
+        })
+        $legalRefLigne = Invoke-RestMethod -Uri $legalRefEndpoint -Headers @{
+            accept        = 'application/json'
+            Authorization = "Bearer $legalRefToken"
+        }
+        $result.LegalRef.Status = 'OK'
+        $result.LegalRef.Data   = $legalRefLigne
+    } catch {
+        $result.LegalRef.Status = 'ERROR'
+        $result.LegalRef.Error  = $_.Exception.Message
+    }
+
+    return $result
+}
+
+#############################################################################
+# Generation du rapport markdown
+#############################################################################
+
+function Format-MarkdownReport {
+    param($Results)
+
+    $statusIcon = {
+        param($s)
+        switch ($s) {
+            'OK'      { 'OK' }
+            'N/A'     { 'N/A' }
+            'ERROR'   { 'KO' }
+            'NOT_RUN' { '-' }
+            default   { $s }
+        }
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+
+    $okCount = ($Results | Where-Object {
+        $_.Peppol.Status -eq 'OK' -and
+        $_.Harmony.Status -eq 'OK' -and
+        ($_.LegalRef.Status -eq 'OK' -or $_.LegalRef.Status -eq 'N/A')
+    }).Count
+    $koCount = $Results.Count - $okCount
+
+    [void]$sb.AppendLine("# Rapport ligne d'adressage")
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("- Date : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine("- Total SIRENs : $($Results.Count)")
+    [void]$sb.AppendLine("- Verts (3 checks OK) : $okCount")
+    [void]$sb.AppendLine("- Avec au moins un KO : $koCount")
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("## Resume")
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("| # | SIREN | Peppol | Harmony | LegalRef | ENV | PA |")
+    [void]$sb.AppendLine("|---|-------|--------|---------|----------|-----|----|")
+    $i = 0
+    foreach ($r in $Results) {
+        $i++
+        $env_ = if ($r.Inference.Data) { $r.Inference.Data.ENV } else { '-' }
+        $pa_  = if ($r.Inference.Data) { $r.Inference.Data.PA }  else { '-' }
+        [void]$sb.AppendLine("| $i | $($r.Siren) | $(& $statusIcon $r.Peppol.Status) | $(& $statusIcon $r.Harmony.Status) | $(& $statusIcon $r.LegalRef.Status) | $env_ | $pa_ |")
+    }
+
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("## Details")
+
+    foreach ($r in $Results) {
+        [void]$sb.AppendLine("")
+        [void]$sb.AppendLine("### $($r.Siren)")
+        [void]$sb.AppendLine("")
+
+        # Peppol
+        [void]$sb.AppendLine("**Peppol** : $($r.Peppol.Status)")
+        if ($r.Peppol.Requests -and $r.Peppol.Requests.Count -gt 0) {
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("*Requetes effectuees* :")
+            [void]$sb.AppendLine((Format-Requests $r.Peppol.Requests))
+        }
+        if ($r.Peppol.Status -eq 'ERROR') {
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine('```')
+            [void]$sb.AppendLine($r.Peppol.Error)
+            [void]$sb.AppendLine('```')
+        } elseif ($r.Peppol.Data) {
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine('```json')
+            [void]$sb.AppendLine(($r.Peppol.Data | ConvertTo-Json -Depth 10))
+            [void]$sb.AppendLine('```')
+        }
+
+        # Inference
+        if ($r.Inference.Status -ne 'NOT_RUN') {
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("**ENV / PA inferes** : $($r.Inference.Status)")
+            if ($r.Inference.Status -eq 'ERROR') {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine('```')
+                [void]$sb.AppendLine($r.Inference.Error)
+                [void]$sb.AppendLine('```')
+            } elseif ($r.Inference.Data) {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine('```json')
+                [void]$sb.AppendLine(($r.Inference.Data | ConvertTo-Json -Depth 10))
+                [void]$sb.AppendLine('```')
+            }
+        }
+
+        # Harmony
+        if ($r.Harmony.Status -ne 'NOT_RUN') {
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("**Harmony-connector** : $($r.Harmony.Status)")
+            if ($r.Harmony.Url) { [void]$sb.AppendLine("- URL : $($r.Harmony.Url)") }
+            if ($r.Harmony.Requests -and $r.Harmony.Requests.Count -gt 0) {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine("*Requetes effectuees* :")
+                [void]$sb.AppendLine((Format-Requests $r.Harmony.Requests))
+            }
+            if ($r.Harmony.Status -eq 'ERROR') {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine('```')
+                [void]$sb.AppendLine($r.Harmony.Error)
+                [void]$sb.AppendLine('```')
+            } elseif ($r.Harmony.Data) {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine('```json')
+                [void]$sb.AppendLine(($r.Harmony.Data | ConvertTo-Json -Depth 10))
+                [void]$sb.AppendLine('```')
+            }
+        }
+
+        # LegalRef
+        if ($r.LegalRef.Status -ne 'NOT_RUN') {
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("**legalRef** : $($r.LegalRef.Status)")
+            if ($r.LegalRef.SubDomain) { [void]$sb.AppendLine("- Sous-domaine : $($r.LegalRef.SubDomain)") }
+            if ($r.LegalRef.Requests -and $r.LegalRef.Requests.Count -gt 0) {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine("*Requetes effectuees* :")
+                [void]$sb.AppendLine((Format-Requests $r.LegalRef.Requests))
+            }
+            if ($r.LegalRef.Status -eq 'ERROR') {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine('```')
+                [void]$sb.AppendLine($r.LegalRef.Error)
+                [void]$sb.AppendLine('```')
+            } elseif ($r.LegalRef.Data) {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine('```json')
+                [void]$sb.AppendLine(($r.LegalRef.Data | ConvertTo-Json -Depth 10))
+                [void]$sb.AppendLine('```')
+            }
+        }
+    }
+
+    return $sb.ToString()
+}
+
 #############################################################################
 # Chargement des secrets et verification des prerequis
 #############################################################################
@@ -172,169 +584,122 @@ foreach ($v in @(
     }
 }
 
-$Scheme = 'iso6523-actorid-upis'
-$Participant = "0225:$Siren"
-
-Write-Log "------------------- Checking $Siren -------------------"
-
 #############################################################################
-# Check peppol
+# Dispatch : mode mono-SIREN ou mode batch
 #############################################################################
 
-$sha = [System.Security.Cryptography.SHA256]::Create()
-try {
-    $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Participant.ToLowerInvariant()))
-} finally {
-    $sha.Dispose()
-}
-$hash = (ConvertTo-Base32 $hashBytes).ToLowerInvariant().Replace('=', '')
-
-$dnsName = "$hash.$Scheme.participant.sml.test.tech.peppol.org"
-
-$smpUrl = Get-PeppolSmpUrl $dnsName
-if ([string]::IsNullOrWhiteSpace($smpUrl)) {
-    Write-Err "No Meta:SMP record found for `"$Participant`" "
-    exit 1
-}
-
-[xml]$smpXml = (Invoke-WebRequest -Uri "$smpUrl/$Scheme::$Participant" -UseBasicParsing).Content
-
-$refNodes = $smpXml.SelectNodes("//*[local-name()='ServiceMetadataReference']")
-$docNumber = $refNodes.Count
-if ($docNumber -lt 1) {
-    Write-Err "No ServiceMetadataReference found for `"$Participant`""
-    exit 1
-}
-$firstDoc = $refNodes[0].GetAttribute('href')
-
-[xml]$firstDocXml = (Invoke-WebRequest -Uri $firstDoc -UseBasicParsing).Content
-
-$apUrl          = Get-XmlText $firstDocXml "//*[local-name()='EndpointReference']/*[local-name()='Address']"
-$smpCertificate = Get-XmlText $firstDocXml "//*[local-name()='X509SubjectName']"
-$certB64        = Get-XmlText $firstDocXml "//*[local-name()='Certificate']"
-
-$apCertSubject = ''
-if ($certB64 -ne '') {
-    $certBytes = [Convert]::FromBase64String(($certB64 -replace '\s', ''))
-    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(, $certBytes)
-    $apCertSubject = $cert.Subject
-}
-
-Write-Log "# Peppol informations for `"$Participant`""
-Write-Json ([ordered]@{
-    SMP_URL                = $smpUrl
-    SMP_CERTIFICATE        = $smpCertificate
-    DOC_NUMBER             = $docNumber
-    AP_URL                 = $apUrl
-    AP_CERTIFICATE_SUBJECT = $apCertSubject
-})
-
-#############################################################################
-# Guessing ENV and PA
-#############################################################################
-
-$tmp = $apUrl -replace '^https://', ''
-$subDomain = ($tmp -split '/', 2)[0]
-$dotIdx = $subDomain.IndexOf('.')
-$domain = if ($dotIdx -ge 0) { $subDomain.Substring($dotIdx + 1) } else { $subDomain }
-
-if ($tmp.Contains('/')) {
-    $urlPath = '/' + $tmp.Substring($tmp.IndexOf('/') + 1)
-} else {
-    $urlPath = '/' + $tmp
-}
-
-$envName = $apUrl -replace '^https://gis-platform-', ''
-$envName = ($envName -split '\.', 2)[0]
-
-switch ($domain) {
-    'generix.biz'             { $pa = 'gnx' }
-    'fulll.house'             { $pa = 'fulll' }
-    'pbis.qa-mypbconnect.com' { $pa = 'pitney-bowes' }
-    'treso2.com'              { $pa = 'pytheas' }
-    default {
-        Write-Err "Unknown domain: `"$domain`""
+if (-not $BatchMode) {
+    # Compat retro : un seul SIREN, sortie console comme avant
+    if ([string]::IsNullOrWhiteSpace($Siren)) {
+        Write-Err "Aucun SIREN fourni. Voir l'en-tete du script pour la syntaxe."
         exit 1
     }
-}
 
-$firstLevel = $urlPath -replace '/harmonypdpap/services/msh$', ''
-if ($firstLevel -ne '') {
-    $pa = $firstLevel -replace '^/', ''
-}
+    Write-Log "------------------- Checking $Siren -------------------"
+    $r = Invoke-LigneCheck -TargetSiren $Siren
 
-Write-Log "# Inferring ENV: `"$envName`" and PA: `"$pa`" from peppol infos for `"$Participant`""
-Write-Json ([ordered]@{
-    ENV        = $envName
-    SUB_DOMAIN = $subDomain
-    DOMAIN     = $domain
-    PA         = $pa
-})
+    if ($r.Peppol.Status -eq 'ERROR') { Write-Err $r.Peppol.Error; exit 1 }
+    Write-Log "# Peppol informations for `"0225:$Siren`""
+    Write-Json $r.Peppol.Data
 
-#############################################################################
-# Check Harmony-connector routing is done
-#############################################################################
+    if ($r.Inference.Status -eq 'ERROR') { Write-Err $r.Inference.Error; exit 1 }
+    Write-Log "# Inferring ENV: `"$($r.Inference.Data.ENV)`" and PA: `"$($r.Inference.Data.PA)`" from peppol infos for `"0225:$Siren`""
+    Write-Json $r.Inference.Data
 
-$harmonyToken = Get-AccessToken $env:HARMONY_CONNECTOR_CLIENT_ID $env:HARMONY_CONNECTOR_CLIENT_SECRET
-
-$harmonyConnectorUrl = "$pa-harmonyconnector-fr-$envName.apps.prd.openshift.vmwr/$pa"
-$harmonyConnectorEndpoint = "https://$harmonyConnectorUrl/harmonyconnector-fr/v1/participants/$Participant"
-
-Write-Log "# Harmony-connector routing for `"$Participant`" from `"$harmonyConnectorUrl`""
-try {
-    $routing = Invoke-RestMethod -Uri $harmonyConnectorEndpoint -Headers @{
-        Accept        = 'application/json'
-        Authorization = "Bearer $harmonyToken"
+    Write-Log "# Harmony-connector routing for `"0225:$Siren`" from `"$($r.Harmony.Url)`""
+    if ($r.Harmony.Status -eq 'ERROR') {
+        Write-Err "No Harmony-connector routing found for `"0225:$Siren`"`n       $($r.Harmony.Url)"
+    } else {
+        Write-Json $r.Harmony.Data
     }
-    Write-Json $routing
-} catch {
-    Write-Err "No Harmony-connector routing found for `"$Participant`"`n       $harmonyConnectorUrl"
+
+    Write-Log "# legalRef informations for `"$Siren`" from `"$($r.LegalRef.SubDomain)`""
+    if ($r.LegalRef.Status -eq 'ERROR') {
+        Write-Err "No legalRef line found for `"$Siren`""
+    } elseif ($r.LegalRef.Status -eq 'OK') {
+        Write-Json $r.LegalRef.Data
+    }
+    exit 0
 }
 
-#############################################################################
-# Check legalRef
-#############################################################################
-
-$legalRefToken = Get-AccessToken $env:LEGALREF_CLIENT_ID $env:LEGALREF_CLIENT_SECRET
-
-$legalRefSubDomain = $null
-switch ("${envName}:${pa}") {
-    'uat:gnx'          { $legalRefSubDomain = 'legalref-api-uat-ppd.staging.apps.generix.biz'; break }
-    'uat:pitney-bowes' { $legalRefSubDomain = 'legalref-api-uat-pitneybowes.staging.apps.generix.biz'; break }
-    'uat:fulll'        { $legalRefSubDomain = 'N/A'; break }
-    'uat:pytheas'      { $legalRefSubDomain = 'N/A'; break }
-    'uat:b4value'      { $legalRefSubDomain = 'N/A'; break }
-    'uat:fiteco'       { $legalRefSubDomain = 'N/A'; break }
-    'uat:spendesk'     { $legalRefSubDomain = 'N/A'; break }
-    'pre:gnx'          { $legalRefSubDomain = 'legalref-api-ppd.staging.apps.generix.biz'; break }
-    'pre:fulll'        { $legalRefSubDomain = 'legalref-api-pprd-fulll.staging.apps.generix.biz'; break }
-    'pre:pitney-bowes' { $legalRefSubDomain = 'legalref-api-pprd-pitneybowes.staging.apps.generix.biz'; break }
-    'pre:pytheas'      { $legalRefSubDomain = 'legalref-api-pprd-pytheas.staging.apps.generix.biz'; break }
-    'pre:b4value'      { $legalRefSubDomain = 'legalref-api-pprd-b4value.staging.apps.generix.biz'; break }
-    'pre:fiteco'       { $legalRefSubDomain = 'legalref-api-pprd-fiteco.staging.apps.generix.biz'; break }
-    'pre:spendesk'     { $legalRefSubDomain = 'legalref-api-pprd-spendesk.staging.apps.generix.biz'; break }
-    'prd:gnx'          { $legalRefSubDomain = 'legalref-api.apps.generix.biz'; break }
-    'prd:fulll'        { $legalRefSubDomain = 'legalref-api-fulll.apps.generix.biz'; break }
-    'prd:pitney-bowes' { $legalRefSubDomain = 'legalref-api-pitneybowes.apps.generix.biz'; break }
-    'prd:pytheas'      { $legalRefSubDomain = 'legalref-api-pytheas.apps.generix.biz'; break }
-    'prd:b4value'      { $legalRefSubDomain = 'legalref-api-b4value.apps.generix.biz'; break }
-    'prd:fiteco'       { $legalRefSubDomain = 'legalref-api-fiteco.apps.generix.biz'; break }
-    'prd:spendesk'     { $legalRefSubDomain = 'legalref-api-spendesk.apps.generix.biz'; break }
-    default {
-        Write-Err "Unsupported ENV/PA combination: `"$envName/$pa`""
+# ----- Mode batch -----
+$inputList = New-Object System.Collections.Generic.List[string]
+if (-not [string]::IsNullOrWhiteSpace($InputFile)) {
+    if (-not (Test-Path -LiteralPath $InputFile)) {
+        Write-Err "Fichier d'entree introuvable : $InputFile"
         exit 1
     }
+    foreach ($line in (Get-Content -LiteralPath $InputFile)) { [void]$inputList.Add($line) }
+}
+if ($Sirens) {
+    foreach ($s in $Sirens) { [void]$inputList.Add($s) }
+}
+if (-not [string]::IsNullOrWhiteSpace($Siren)) {
+    [void]$inputList.Add($Siren)
 }
 
-Write-Log "# legalRef informations for `"$Siren`" from `"$legalRefSubDomain`""
-try {
-    $legalRefLigne = Invoke-RestMethod `
-        -Uri "https://$legalRefSubDomain/ppf/annuaire-public/v2/ligne-annuaire/code:$Siren" `
-        -Headers @{
-            accept        = 'application/json'
-            Authorization = "Bearer $legalRefToken"
+# Nettoyage + dedup
+$cleanList = New-Object System.Collections.Generic.List[string]
+$seen      = New-Object System.Collections.Generic.HashSet[string]
+$skipped   = New-Object System.Collections.Generic.List[string]
+foreach ($line in $inputList) {
+    $clean = Get-CleanSiren $line
+    if ($null -eq $clean) {
+        if (-not [string]::IsNullOrWhiteSpace($line) -and -not $line.Trim().StartsWith('#')) {
+            [void]$skipped.Add($line)
         }
-    Write-Json $legalRefLigne
-} catch {
-    Write-Err "No legalRef line found for `"$Siren`""
+        continue
+    }
+    if ($seen.Add($clean)) { [void]$cleanList.Add($clean) }
 }
+
+if ($cleanList.Count -eq 0) {
+    Write-Err "Aucun SIREN valide trouve apres nettoyage."
+    exit 1
+}
+
+Write-Host ""
+Write-Host "Mode batch : $($cleanList.Count) SIREN(s) a verifier."
+if ($skipped.Count -gt 0) {
+    Write-Host "  $($skipped.Count) ligne(s) ignoree(s) (format non reconnu)." -ForegroundColor Yellow
+}
+Write-Host ""
+
+$results = New-Object System.Collections.Generic.List[object]
+$idx = 0
+foreach ($s in $cleanList) {
+    $idx++
+    $prefix = "[{0}/{1}] {2}" -f $idx, $cleanList.Count, $s
+    try {
+        $r = Invoke-LigneCheck -TargetSiren $s
+    } catch {
+        $r = [ordered]@{
+            Siren     = $s
+            Peppol    = [ordered]@{ Status = 'ERROR'; Error = "Unexpected: $($_.Exception.Message)" }
+            Inference = [ordered]@{ Status = 'NOT_RUN' }
+            Harmony   = [ordered]@{ Status = 'NOT_RUN' }
+            LegalRef  = [ordered]@{ Status = 'NOT_RUN' }
+        }
+    }
+    [void]$results.Add($r)
+    $summary = "peppol={0} harmony={1} legalref={2}" -f `
+        $r.Peppol.Status, $r.Harmony.Status, $r.LegalRef.Status
+    $color = if ($r.Peppol.Status -eq 'OK' -and $r.Harmony.Status -eq 'OK' -and ($r.LegalRef.Status -eq 'OK' -or $r.LegalRef.Status -eq 'N/A')) { 'Green' } else { 'Yellow' }
+    Write-Host "$prefix  $summary" -ForegroundColor $color
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputMarkdown)) {
+    $OutputMarkdown = Join-Path $ScriptDir 'rapport.md'
+}
+
+$md = Format-MarkdownReport -Results $results
+[System.IO.File]::WriteAllText($OutputMarkdown, $md, [System.Text.UTF8Encoding]::new($false))
+
+Write-Host ""
+Write-Host "Rapport ecrit : $OutputMarkdown"
+if ($skipped.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Lignes ignorees :" -ForegroundColor Yellow
+    foreach ($l in $skipped) { Write-Host "  - $l" -ForegroundColor Yellow }
+}
+exit 0
