@@ -5,6 +5,15 @@
 #
 # Verifie peppol, Harmony-connector et legalRef pour un SIREN_SUFIX donne.
 #
+# Le check Harmony verifie aussi que l'environmentId renvoye par Harmony
+# correspond a celui attendu pour le client. Le mapping est compose a partir
+# de :
+#   - client-siren.csv (Env;Client;SIREN_TESTPILOTE)  -> SIREN -> Client
+#   - data.csv         (Client_name;Env;envId)        -> Client -> envId attendu
+# Si l'envId reel != envId attendu : Harmony = MISMATCH.
+# Si le mapping est incomplet (SIREN absent ou client absent de data.csv) :
+# Harmony = UNVERIFIED.
+#
 # Mode mono-SIREN (sortie console) :
 #   .\ligne_full_check.ps1 432526903_TESTPILOTE             # mode DEBUG (defaut)
 #   .\ligne_full_check.ps1 432526903_TESTPILOTE false       # mode ERROR_ONLY
@@ -179,11 +188,79 @@ function Get-CleanSiren {
     if ($t.StartsWith('#')) { return $null }
     # Strip trailing parenthesised label (ex : "... (Delpeyrat)")
     $t = $t -replace '\s*\([^)]*\)\s*$', ''
+    # Strip non-ASCII/control noise (cellules de client-siren.csv parfois corrompues)
+    $t = $t -replace '[^\x20-\x7E]', ''
+    # Strip trailing non-alnum noise (?, ?? etc.)
+    $t = $t -replace '[^A-Za-z0-9_]+$', ''
     # Match \d{9,10}\s*_<non-space-suite>, tolere un espace parasite avant _
     if ($t -match '(\d{9,10})\s*_(\S+)') {
         return $Matches[1] + '_' + $Matches[2]
     }
     return $null
+}
+
+# Charge data.csv (Client_name;Env;envId) et client-siren.csv (Env;Client;SIREN_TESTPILOTE)
+# et compose un map SIREN_SUFIX -> envId attendu (via le client).
+function Import-SirenMappings {
+    param([string]$ScriptDir)
+
+    $cmp                  = [System.StringComparer]::OrdinalIgnoreCase
+    $clientToEnvId        = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
+    $sirenToClient        = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
+    $sirenToExpectedEnvId = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
+
+    $dataPath = Join-Path $ScriptDir 'data.csv'
+    if (Test-Path -LiteralPath $dataPath) {
+        try {
+            $rows = Import-Csv -LiteralPath $dataPath -Delimiter ';'
+            foreach ($row in $rows) {
+                $client = if ($row.PSObject.Properties['Client_name']) { [string]$row.Client_name } else { '' }
+                $envId  = if ($row.PSObject.Properties['envId'])       { [string]$row.envId }       else { '' }
+                $client = ($client -replace '[^\x20-\x7E]', '').Trim()
+                $envId  = ($envId  -replace '[^\x20-\x7E]', '').Trim()
+                if ([string]::IsNullOrWhiteSpace($client) -or [string]::IsNullOrWhiteSpace($envId)) { continue }
+                if (-not $clientToEnvId.ContainsKey($client)) {
+                    $clientToEnvId[$client] = $envId
+                }
+            }
+        } catch {
+            Write-Host "Avertissement : lecture de data.csv impossible ($($_.Exception.Message))" -ForegroundColor Yellow
+        }
+    }
+
+    $clientSirenPath = Join-Path $ScriptDir 'client-siren.csv'
+    if (Test-Path -LiteralPath $clientSirenPath) {
+        try {
+            $rows = Import-Csv -LiteralPath $clientSirenPath -Delimiter ';'
+            foreach ($row in $rows) {
+                $client    = if ($row.PSObject.Properties['Client'])           { [string]$row.Client }           else { '' }
+                $sirenCell = if ($row.PSObject.Properties['SIREN_TESTPILOTE']) { [string]$row.SIREN_TESTPILOTE } else { '' }
+                $client    = ($client -replace '[^\x20-\x7E]', '').Trim()
+                if ([string]::IsNullOrWhiteSpace($client) -or [string]::IsNullOrWhiteSpace($sirenCell)) { continue }
+                foreach ($raw in ($sirenCell -split '[\r\n]+')) {
+                    $cleaned = Get-CleanSiren $raw
+                    if ($cleaned -and -not $sirenToClient.ContainsKey($cleaned)) {
+                        $sirenToClient[$cleaned] = $client
+                    }
+                }
+            }
+        } catch {
+            Write-Host "Avertissement : lecture de client-siren.csv impossible ($($_.Exception.Message))" -ForegroundColor Yellow
+        }
+    }
+
+    foreach ($siren in $sirenToClient.Keys) {
+        $client = $sirenToClient[$siren]
+        if ($clientToEnvId.ContainsKey($client)) {
+            $sirenToExpectedEnvId[$siren] = $clientToEnvId[$client]
+        }
+    }
+
+    return [pscustomobject]@{
+        ClientToEnvId        = $clientToEnvId
+        SirenToClient        = $sirenToClient
+        SirenToExpectedEnvId = $sirenToExpectedEnvId
+    }
 }
 
 # Formate une liste de requetes HTTP capturees en markdown (puces + sous-puces).
@@ -205,13 +282,27 @@ function Format-Requests {
 #############################################################################
 
 function Invoke-LigneCheck {
-    param([string]$TargetSiren)
+    param(
+        [string]$TargetSiren,
+        [string]$ExpectedClient,
+        [string]$ExpectedEnvId
+    )
 
     $result = [ordered]@{
         Siren     = $TargetSiren
         Peppol    = [ordered]@{ Status = 'NOT_RUN'; Data = $null; Error = $null; Requests = (New-Object System.Collections.ArrayList) }
         Inference = [ordered]@{ Status = 'NOT_RUN'; Data = $null; Error = $null }
-        Harmony   = [ordered]@{ Status = 'NOT_RUN'; Url = $null; Data = $null; Error = $null; Requests = (New-Object System.Collections.ArrayList) }
+        Harmony   = [ordered]@{
+            Status         = 'NOT_RUN'
+            Url            = $null
+            Data           = $null
+            Error          = $null
+            Requests       = (New-Object System.Collections.ArrayList)
+            ExpectedClient = $ExpectedClient
+            ExpectedEnvId  = $ExpectedEnvId
+            ActualEnvId    = $null
+            EnvIdCheck     = 'NOT_RUN'
+        }
         LegalRef  = [ordered]@{ Status = 'NOT_RUN'; SubDomain = $null; Data = $null; Error = $null; Requests = (New-Object System.Collections.ArrayList) }
     }
 
@@ -351,8 +442,26 @@ function Invoke-LigneCheck {
             Accept        = 'application/json'
             Authorization = "Bearer $harmonyToken"
         }
-        $result.Harmony.Status = 'OK'
         $result.Harmony.Data   = $routing
+
+        $actualEnvId = $null
+        if ($routing -and $routing.PSObject.Properties['environmentId']) {
+            $actualEnvId = [string]$routing.environmentId
+        }
+        $result.Harmony.ActualEnvId = $actualEnvId
+
+        if ([string]::IsNullOrWhiteSpace($ExpectedEnvId)) {
+            $result.Harmony.EnvIdCheck = 'UNKNOWN'
+            $result.Harmony.Status     = 'UNVERIFIED'
+        } elseif (-not [string]::IsNullOrWhiteSpace($actualEnvId) -and
+                  [string]::Equals($actualEnvId, $ExpectedEnvId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $result.Harmony.EnvIdCheck = 'MATCH'
+            $result.Harmony.Status     = 'OK'
+        } else {
+            $result.Harmony.EnvIdCheck = 'MISMATCH'
+            $result.Harmony.Status     = 'MISMATCH'
+            $result.Harmony.Error      = "envId attendu '$ExpectedEnvId' != envId recu '$actualEnvId'"
+        }
     } catch {
         $result.Harmony.Status = 'ERROR'
         $result.Harmony.Error  = $_.Exception.Message
@@ -435,11 +544,13 @@ function Format-MarkdownReport {
     $statusIcon = {
         param($s)
         switch ($s) {
-            'OK'      { 'OK' }
-            'N/A'     { 'N/A' }
-            'ERROR'   { 'KO' }
-            'NOT_RUN' { '-' }
-            default   { $s }
+            'OK'         { 'OK' }
+            'N/A'        { 'N/A' }
+            'ERROR'      { 'KO' }
+            'MISMATCH'   { 'MISMATCH' }
+            'UNVERIFIED' { 'OK (?)' }
+            'NOT_RUN'    { '-' }
+            default      { $s }
         }
     }
 
@@ -450,25 +561,31 @@ function Format-MarkdownReport {
         $_.Harmony.Status -eq 'OK' -and
         ($_.LegalRef.Status -eq 'OK' -or $_.LegalRef.Status -eq 'N/A')
     }).Count
-    $koCount = $Results.Count - $okCount
+    $mismatchCount   = ($Results | Where-Object { $_.Harmony.Status -eq 'MISMATCH' }).Count
+    $unverifiedCount = ($Results | Where-Object { $_.Harmony.Status -eq 'UNVERIFIED' }).Count
+    $koCount         = $Results.Count - $okCount
 
     [void]$sb.AppendLine("# Rapport ligne d'adressage")
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("- Date : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
     [void]$sb.AppendLine("- Total SIRENs : $($Results.Count)")
-    [void]$sb.AppendLine("- Verts (3 checks OK) : $okCount")
-    [void]$sb.AppendLine("- Avec au moins un KO : $koCount")
+    [void]$sb.AppendLine("- Verts (3 checks OK + envId conforme) : $okCount")
+    [void]$sb.AppendLine("- Harmony envId MISMATCH : $mismatchCount")
+    [void]$sb.AppendLine("- Harmony envId non verifie (mapping absent) : $unverifiedCount")
+    [void]$sb.AppendLine("- Avec au moins un KO/MISMATCH : $koCount")
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("## Resume")
     [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("| # | SIREN | Peppol | Harmony | LegalRef | ENV | PA |")
-    [void]$sb.AppendLine("|---|-------|--------|---------|----------|-----|----|")
+    [void]$sb.AppendLine("| # | SIREN | Peppol | Harmony | envId attendu | envId recu | LegalRef | ENV | PA |")
+    [void]$sb.AppendLine("|---|-------|--------|---------|---------------|------------|----------|-----|----|")
     $i = 0
     foreach ($r in $Results) {
         $i++
-        $env_ = if ($r.Inference.Data) { $r.Inference.Data.ENV } else { '-' }
-        $pa_  = if ($r.Inference.Data) { $r.Inference.Data.PA }  else { '-' }
-        [void]$sb.AppendLine("| $i | $($r.Siren) | $(& $statusIcon $r.Peppol.Status) | $(& $statusIcon $r.Harmony.Status) | $(& $statusIcon $r.LegalRef.Status) | $env_ | $pa_ |")
+        $env_      = if ($r.Inference.Data) { $r.Inference.Data.ENV } else { '-' }
+        $pa_       = if ($r.Inference.Data) { $r.Inference.Data.PA }  else { '-' }
+        $expected_ = if ($r.Harmony.ExpectedEnvId) { $r.Harmony.ExpectedEnvId } else { '-' }
+        $actual_   = if ($r.Harmony.ActualEnvId)   { $r.Harmony.ActualEnvId }   else { '-' }
+        [void]$sb.AppendLine("| $i | $($r.Siren) | $(& $statusIcon $r.Peppol.Status) | $(& $statusIcon $r.Harmony.Status) | $expected_ | $actual_ | $(& $statusIcon $r.LegalRef.Status) | $env_ | $pa_ |")
     }
 
     [void]$sb.AppendLine("")
@@ -520,17 +637,24 @@ function Format-MarkdownReport {
             [void]$sb.AppendLine("")
             [void]$sb.AppendLine("**Harmony-connector** : $($r.Harmony.Status)")
             if ($r.Harmony.Url) { [void]$sb.AppendLine("- URL : $($r.Harmony.Url)") }
+            if ($r.Harmony.ExpectedClient) { [void]$sb.AppendLine("- Client attendu (client-siren.csv) : $($r.Harmony.ExpectedClient)") }
+            if ($r.Harmony.ExpectedEnvId)  { [void]$sb.AppendLine("- envId attendu (data.csv)         : $($r.Harmony.ExpectedEnvId)") }
+            if ($r.Harmony.ActualEnvId)    { [void]$sb.AppendLine("- envId recu (Harmony)             : $($r.Harmony.ActualEnvId)") }
+            if ($r.Harmony.EnvIdCheck -and $r.Harmony.EnvIdCheck -ne 'NOT_RUN') {
+                [void]$sb.AppendLine("- Comparaison envId                : $($r.Harmony.EnvIdCheck)")
+            }
             if ($r.Harmony.Requests -and $r.Harmony.Requests.Count -gt 0) {
                 [void]$sb.AppendLine("")
                 [void]$sb.AppendLine("*Requetes effectuees* :")
                 [void]$sb.AppendLine((Format-Requests $r.Harmony.Requests))
             }
-            if ($r.Harmony.Status -eq 'ERROR') {
+            if ($r.Harmony.Status -eq 'ERROR' -or $r.Harmony.Status -eq 'MISMATCH') {
                 [void]$sb.AppendLine("")
                 [void]$sb.AppendLine('```')
                 [void]$sb.AppendLine($r.Harmony.Error)
                 [void]$sb.AppendLine('```')
-            } elseif ($r.Harmony.Data) {
+            }
+            if ($r.Harmony.Data) {
                 [void]$sb.AppendLine("")
                 [void]$sb.AppendLine('```json')
                 [void]$sb.AppendLine(($r.Harmony.Data | ConvertTo-Json -Depth 10))
@@ -584,6 +708,22 @@ foreach ($v in @(
     }
 }
 
+# Mappings client-siren.csv + data.csv pour la verification de l'envId Harmony
+$Mappings = Import-SirenMappings -ScriptDir $ScriptDir
+
+function Get-ExpectedHarmonyContext {
+    param([string]$Siren)
+    $client = $null
+    $envId  = $null
+    if ($Mappings.SirenToClient.ContainsKey($Siren)) {
+        $client = $Mappings.SirenToClient[$Siren]
+    }
+    if ($Mappings.SirenToExpectedEnvId.ContainsKey($Siren)) {
+        $envId = $Mappings.SirenToExpectedEnvId[$Siren]
+    }
+    return [pscustomobject]@{ Client = $client; EnvId = $envId }
+}
+
 #############################################################################
 # Dispatch : mode mono-SIREN ou mode batch
 #############################################################################
@@ -595,8 +735,12 @@ if (-not $BatchMode) {
         exit 1
     }
 
+    $cleanedSiren = Get-CleanSiren $Siren
+    if ($cleanedSiren) { $Siren = $cleanedSiren }
+    $ctx = Get-ExpectedHarmonyContext -Siren $Siren
+
     Write-Log "------------------- Checking $Siren -------------------"
-    $r = Invoke-LigneCheck -TargetSiren $Siren
+    $r = Invoke-LigneCheck -TargetSiren $Siren -ExpectedClient $ctx.Client -ExpectedEnvId $ctx.EnvId
 
     if ($r.Peppol.Status -eq 'ERROR') { Write-Err $r.Peppol.Error; exit 1 }
     Write-Log "# Peppol informations for `"0225:$Siren`""
@@ -611,6 +755,11 @@ if (-not $BatchMode) {
         Write-Err "No Harmony-connector routing found for `"0225:$Siren`"`n       $($r.Harmony.Url)"
     } else {
         Write-Json $r.Harmony.Data
+        if ($r.Harmony.Status -eq 'MISMATCH') {
+            Write-Err "Harmony envId MISMATCH pour `"0225:$Siren`" (client `"$($r.Harmony.ExpectedClient)`")`n       attendu : $($r.Harmony.ExpectedEnvId)`n       recu    : $($r.Harmony.ActualEnvId)"
+        } elseif ($r.Harmony.Status -eq 'UNVERIFIED') {
+            Write-Log "# Harmony envId non verifie : SIREN `"$Siren`" absent de client-siren.csv ou client absent de data.csv"
+        }
     }
 
     Write-Log "# legalRef informations for `"$Siren`" from `"$($r.LegalRef.SubDomain)`""
@@ -670,21 +819,28 @@ $idx = 0
 foreach ($s in $cleanList) {
     $idx++
     $prefix = "[{0}/{1}] {2}" -f $idx, $cleanList.Count, $s
+    $ctx = Get-ExpectedHarmonyContext -Siren $s
     try {
-        $r = Invoke-LigneCheck -TargetSiren $s
+        $r = Invoke-LigneCheck -TargetSiren $s -ExpectedClient $ctx.Client -ExpectedEnvId $ctx.EnvId
     } catch {
         $r = [ordered]@{
             Siren     = $s
             Peppol    = [ordered]@{ Status = 'ERROR'; Error = "Unexpected: $($_.Exception.Message)" }
             Inference = [ordered]@{ Status = 'NOT_RUN' }
-            Harmony   = [ordered]@{ Status = 'NOT_RUN' }
+            Harmony   = [ordered]@{ Status = 'NOT_RUN'; ExpectedClient = $ctx.Client; ExpectedEnvId = $ctx.EnvId; ActualEnvId = $null; EnvIdCheck = 'NOT_RUN' }
             LegalRef  = [ordered]@{ Status = 'NOT_RUN' }
         }
     }
     [void]$results.Add($r)
     $summary = "peppol={0} harmony={1} legalref={2}" -f `
         $r.Peppol.Status, $r.Harmony.Status, $r.LegalRef.Status
-    $color = if ($r.Peppol.Status -eq 'OK' -and $r.Harmony.Status -eq 'OK' -and ($r.LegalRef.Status -eq 'OK' -or $r.LegalRef.Status -eq 'N/A')) { 'Green' } else { 'Yellow' }
+    $color = if ($r.Peppol.Status -eq 'OK' -and $r.Harmony.Status -eq 'OK' -and ($r.LegalRef.Status -eq 'OK' -or $r.LegalRef.Status -eq 'N/A')) {
+        'Green'
+    } elseif ($r.Harmony.Status -eq 'MISMATCH') {
+        'Red'
+    } else {
+        'Yellow'
+    }
     Write-Host "$prefix  $summary" -ForegroundColor $color
 }
 

@@ -3,7 +3,7 @@
 Vérifie l'enregistrement d'un participant (par son SIREN) sur trois systèmes :
 
 1. **Peppol** — résolution SML/SMP et récupération des informations d'Access Point.
-2. **Harmony-connector** — contrôle que le routage du participant est en place.
+2. **Harmony-connector** — contrôle que le routage du participant est en place **et que l'`environmentId` renvoyé correspond à celui attendu pour le client** (voir _Mapping envId_ ci-dessous).
 3. **legalRef** — récupération de la ligne d'annuaire associée au SIREN.
 
 Le script déduit automatiquement l'environnement (`uat`, `pre`, `prd`) et le PA
@@ -22,6 +22,8 @@ Deux modes d'exécution :
 | `ligne_full_check.sh`   | Version Bash / Linux (requiert `curl`, `jq`, `base32`, `xmllint`, `openssl`, `dig`). Supporte le mode batch + rapport Markdown. |
 | `run.cmd`               | Lanceur Windows interactif pour le script PowerShell (mono-SIREN). |
 | `script.env.example`    | Modèle de configuration des secrets.                               |
+| `data.csv`              | Mapping `Client_name;Env;envId` — source de vérité de l'`envId` attendu par client. |
+| `client-siren.csv`      | Mapping `Env;Client;SIREN_TESTPILOTE` — relie chaque SIREN à un client de `data.csv`. |
 
 ## Configuration
 
@@ -114,14 +116,35 @@ Les options longues `--input-file`, `--sirens`, `--output-markdown` sont aussi
 acceptées. `script.env` est chargé automatiquement s'il se trouve à côté du
 script (`source ./script.env` reste possible).
 
+### Mapping envId (vérification Harmony)
+
+L'API Harmony peut renvoyer un routage **valide** (HTTP 200) mais pointant vers
+un **mauvais** `environmentId` (ex. routage créé par erreur dans un env voisin).
+Pour le détecter, le script confronte l'`environmentId` reçu à celui attendu :
+
+1. `client-siren.csv` (`Env;Client;SIREN_TESTPILOTE`) — chaque SIREN est associé
+   à un nom de client. Les cellules multi-lignes entre guillemets sont gérées.
+2. `data.csv` (`Client_name;Env;envId`) — chaque client a un `envId` cible.
+
+Statut Harmony résultant :
+
+- `OK` — API + `environmentId` reçu == `envId` attendu.
+- `MISMATCH` — API OK mais `environmentId` reçu != `envId` attendu.
+- `OK (?)` (`UNVERIFIED`) — API OK mais le mapping est incomplet (SIREN absent
+  de `client-siren.csv`, ou client absent de `data.csv`).
+- `KO` (`ERROR`) — API en échec.
+
+Les deux CSV sont chargés au lancement du script ; aucune option à passer.
+
 ### Contenu du rapport Markdown
 
 Le rapport généré contient :
 
-1. **En-tête** : date, total de SIRENs traités, nombre de verts (3 checks OK) et de KO.
-2. **Tableau résumé** : une ligne par SIREN avec colonnes `Peppol | Harmony | LegalRef | ENV | PA`.
+1. **En-tête** : date, total de SIRENs traités, nombre de verts (3 checks OK + envId conforme), de MISMATCH, de non vérifiés et de KO.
+2. **Tableau résumé** : une ligne par SIREN avec colonnes `Peppol | Harmony | envId attendu | envId reçu | LegalRef | ENV | PA`.
 3. **Section "Details"** : un bloc par SIREN avec, pour chaque check :
-   - le statut (`OK`, `ERROR`, `N/A`, `NOT_RUN`) ;
+   - le statut (`OK`, `ERROR`, `MISMATCH`, `UNVERIFIED`, `N/A`, `NOT_RUN`) ;
+   - pour Harmony : le client attendu, l'`envId` attendu, l'`envId` reçu et le résultat de la comparaison (`MATCH`/`MISMATCH`/`UNKNOWN`) ;
    - la liste des **requêtes HTTP effectuées** (méthode + URL, body et header sanitisés — `client_secret=***`, `Bearer <token>`) ;
    - le JSON de réponse ou le message d'erreur exact.
 

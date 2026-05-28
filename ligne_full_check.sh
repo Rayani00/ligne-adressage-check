@@ -5,6 +5,14 @@
 #
 # Verifie peppol, Harmony-connector et legalRef pour un ou plusieurs SIREN_SUFIX.
 #
+# Le check Harmony verifie aussi que l'environmentId renvoye par Harmony
+# correspond a celui attendu pour le client. Le mapping est compose a partir
+# de :
+#   - client-siren.csv (Env;Client;SIREN_TESTPILOTE)  -> SIREN -> Client
+#   - data.csv         (Client_name;Env;envId)        -> Client -> envId attendu
+# Si l'envId reel != envId attendu : Harmony = MISMATCH.
+# Si le mapping est incomplet : Harmony = UNVERIFIED.
+#
 # Mode mono-SIREN (sortie console) :
 #   . ./script.env
 #   ./ligne_full_check.sh 432526903_TESTPILOTE             # DEBUG (defaut)
@@ -97,12 +105,96 @@ md_format_requests() {
 
 status_icon() {
   case "$1" in
-    OK)      printf 'OK' ;;
-    'N/A')   printf 'N/A' ;;
-    ERROR)   printf 'KO' ;;
-    NOT_RUN) printf -- '-' ;;
-    *)       printf '%s' "$1" ;;
+    OK)         printf 'OK' ;;
+    'N/A')      printf 'N/A' ;;
+    ERROR)      printf 'KO' ;;
+    MISMATCH)   printf 'MISMATCH' ;;
+    UNVERIFIED) printf 'OK (?)' ;;
+    NOT_RUN)    printf -- '-' ;;
+    *)          printf '%s' "$1" ;;
   esac
+}
+
+# Parse data.csv (Client_name;Env;envId) -> stdout: "client|envid" lignes nettoyees.
+parse_data_csv() {
+  local file="$1"
+  [[ ! -f "$file" ]] && return 0
+  awk -F';' '
+    NR == 1 { next }
+    {
+      client = $1; envid = $3
+      gsub(/[^\x20-\x7E]/, "", client)
+      gsub(/[^\x20-\x7E]/, "", envid)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", client)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", envid)
+      if (client != "" && envid != "") print client "|" envid
+    }
+  ' "$file"
+}
+
+# Parse client-siren.csv (Env;Client;SIREN_TESTPILOTE) en gerant les cellules
+# multi-lignes entre guillemets. Stdout : "client|siren_suffix" lignes nettoyees.
+parse_client_siren_csv() {
+  local file="$1"
+  [[ ! -f "$file" ]] && return 0
+  awk '
+    BEGIN { buf = ""; first = 1 }
+    {
+      buf = (buf == "" ? $0 : buf "\n" $0)
+      q = gsub(/"/, "&", buf)
+      if (q % 2 != 0) next
+      logical = buf
+      buf = ""
+      if (first) { first = 0; next }
+
+      i1 = index(logical, ";")
+      if (i1 == 0) next
+      rest1 = substr(logical, i1 + 1)
+      i2 = index(rest1, ";")
+      if (i2 == 0) next
+      client = substr(rest1, 1, i2 - 1)
+      siren_cell = substr(rest1, i2 + 1)
+
+      gsub(/^"|"$/, "", siren_cell)
+      gsub(/[^\x20-\x7E]/, "", client)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", client)
+      if (client == "") next
+
+      n = split(siren_cell, sirens, /\n/)
+      for (k = 1; k <= n; k++) {
+        s = sirens[k]
+        gsub(/[^A-Za-z0-9_]/, "", s)
+        if (match(s, /^[0-9]{9,10}_/)) {
+          print client "|" s
+        }
+      }
+    }
+  ' "$file"
+}
+
+declare -A CLIENT_TO_ENVID
+declare -A SIREN_TO_CLIENT
+declare -A SIREN_TO_EXPECTED_ENVID
+
+load_mappings() {
+  local dir="$1"
+  local client envid siren
+  while IFS='|' read -r client envid; do
+    [[ -z "$client" || -z "$envid" ]] && continue
+    [[ -z "${CLIENT_TO_ENVID[$client]:-}" ]] && CLIENT_TO_ENVID[$client]="$envid"
+  done < <(parse_data_csv "${dir}/data.csv")
+
+  while IFS='|' read -r client siren; do
+    [[ -z "$client" || -z "$siren" ]] && continue
+    [[ -z "${SIREN_TO_CLIENT[$siren]:-}" ]] && SIREN_TO_CLIENT[$siren]="$client"
+  done < <(parse_client_siren_csv "${dir}/client-siren.csv")
+
+  for siren in "${!SIREN_TO_CLIENT[@]}"; do
+    client="${SIREN_TO_CLIENT[$siren]}"
+    if [[ -n "${CLIENT_TO_ENVID[$client]:-}" ]]; then
+      SIREN_TO_EXPECTED_ENVID[$siren]="${CLIENT_TO_ENVID[$client]}"
+    fi
+  done
 }
 
 get_access_token() {
@@ -126,6 +218,8 @@ get_access_token() {
 check_one_siren() {
   local siren="$1"
   local details_file="${2:-}"
+  local expected_client="${3:-}"
+  local expected_env_id="${4:-}"
   local mode='console'
   [[ -n "$details_file" ]] && mode='markdown'
 
@@ -141,6 +235,7 @@ check_one_siren() {
     local harmony_status='NOT_RUN' harmony_error=''
     local legalref_status='NOT_RUN' legalref_error=''
     local env_name='-' pa_name='-'
+    local actual_env_id='' env_id_check='NOT_RUN'
 
     local -a peppol_reqs=() harmony_reqs=() legalref_reqs=()
 
@@ -253,8 +348,19 @@ check_one_siren() {
             harmony_status='ERROR'
             harmony_error="$h_response"
           else
-            harmony_status='OK'
             participant_routing="$h_response"
+            actual_env_id=$(printf '%s' "$h_response" | jq -r '.environmentId // empty' 2>/dev/null)
+            if [[ -z "$expected_env_id" ]]; then
+              harmony_status='UNVERIFIED'
+              env_id_check='UNKNOWN'
+            elif [[ "$actual_env_id" == "$expected_env_id" ]]; then
+              harmony_status='OK'
+              env_id_check='MATCH'
+            else
+              harmony_status='MISMATCH'
+              env_id_check='MISMATCH'
+              harmony_error="envId attendu '$expected_env_id' != envId recu '$actual_env_id'"
+            fi
           fi
         fi
 
@@ -358,12 +464,19 @@ check_one_siren() {
         if [[ "$harmony_status" != 'NOT_RUN' ]]; then
           printf '\n**Harmony-connector** : %s\n' "$harmony_status"
           [[ -n "$harmony_connector_url" ]] && printf -- '- URL : %s\n' "$harmony_connector_url"
+          [[ -n "$expected_client" ]]      && printf -- '- Client attendu (client-siren.csv) : %s\n' "$expected_client"
+          [[ -n "$expected_env_id" ]]      && printf -- '- envId attendu (data.csv)         : %s\n' "$expected_env_id"
+          [[ -n "$actual_env_id" ]]        && printf -- '- envId recu (Harmony)             : %s\n' "$actual_env_id"
+          if [[ "$env_id_check" != 'NOT_RUN' ]]; then
+            printf -- '- Comparaison envId                : %s\n' "$env_id_check"
+          fi
           if [[ ${#harmony_reqs[@]} -gt 0 ]]; then
             md_format_requests "${harmony_reqs[@]}"
           fi
-          if [[ "$harmony_status" == 'ERROR' ]]; then
+          if [[ "$harmony_status" == 'ERROR' || "$harmony_status" == 'MISMATCH' ]]; then
             printf '\n```\n%s\n```\n' "$harmony_error"
-          elif [[ "$harmony_status" == 'OK' && -n "$participant_routing" ]]; then
+          fi
+          if [[ -n "$participant_routing" ]]; then
             printf '\n```json\n%s\n```\n' "$(printf '%s' "$participant_routing" | jq .)"
           fi
         fi
@@ -383,7 +496,7 @@ check_one_siren() {
         fi
       } >> "$details_file"
 
-      printf '%s|%s|%s|%s|%s\n' "$peppol_status" "$harmony_status" "$legalref_status" "$env_name" "$pa_name"
+      printf '%s|%s|%s|%s|%s|%s|%s\n' "$peppol_status" "$harmony_status" "$legalref_status" "$env_name" "$pa_name" "$expected_env_id" "$actual_env_id"
     else
       # Console mode : reprend l'esprit du script mono-SIREN d'origine
       log "------------------- Checking ${siren} -------------------"
@@ -411,6 +524,11 @@ check_one_siren() {
         err "No Harmony-connector routing found for \"${participant}\" \n       ${harmony_connector_url}\n"
       else
         log "$(printf '%s' "$participant_routing" | jq -C .)"
+        if [[ "$harmony_status" == 'MISMATCH' ]]; then
+          err "Harmony envId MISMATCH pour \"${participant}\" (client \"${expected_client}\")\n       attendu : ${expected_env_id}\n       recu    : ${actual_env_id}\n"
+        elif [[ "$harmony_status" == 'UNVERIFIED' ]]; then
+          log "# Harmony envId non verifie : SIREN \"${siren}\" absent de client-siren.csv ou client absent de data.csv"
+        fi
       fi
 
       log "# legalRef informations for \"${siren}\" from \"${legalref_sub_domain}\""
@@ -466,6 +584,8 @@ main() {
     [[ -z "${!v:-}" ]] && { err "Missing env var: $v\n  source ./script.env first, or define it in the environment.\n"; exit 1; }
   done
 
+  load_mappings "$script_dir"
+
   local batch_mode='false'
   if [[ -n "$INPUT_FILE" || -n "$OUTPUT_MARKDOWN" || -n "$SIRENS_CLI" ]]; then
     batch_mode='true'
@@ -473,7 +593,12 @@ main() {
 
   if [[ "$batch_mode" == 'false' ]]; then
     [[ -z "$POSITIONAL_SIREN" ]] && { err "Missing SIREN argument\n"; usage 1; }
-    check_one_siren "$POSITIONAL_SIREN" ''
+    local cleaned_pos exp_client exp_envid
+    cleaned_pos=$(clean_siren "$POSITIONAL_SIREN")
+    [[ -n "$cleaned_pos" ]] && POSITIONAL_SIREN="$cleaned_pos"
+    exp_client="${SIREN_TO_CLIENT[$POSITIONAL_SIREN]:-}"
+    exp_envid="${SIREN_TO_EXPECTED_ENVID[$POSITIONAL_SIREN]:-}"
+    check_one_siren "$POSITIONAL_SIREN" '' "$exp_client" "$exp_envid"
     exit 0
   fi
 
@@ -532,40 +657,48 @@ main() {
 
   local -a summary_rows=()
   local idx=0 total=${#cleaned[@]}
-  local siren status_line p h l e pa
+  local siren status_line p h l e pa expected_env actual_env exp_client exp_envid
   for siren in "${cleaned[@]}"; do
     idx=$((idx+1))
-    status_line=$(check_one_siren "$siren" "$details_tmp" 2>/dev/null | tail -1)
+    exp_client="${SIREN_TO_CLIENT[$siren]:-}"
+    exp_envid="${SIREN_TO_EXPECTED_ENVID[$siren]:-}"
+    status_line=$(check_one_siren "$siren" "$details_tmp" "$exp_client" "$exp_envid" 2>/dev/null | tail -1)
     summary_rows+=("${siren}|${status_line}")
-    IFS='|' read -r p h l e pa <<< "$status_line"
+    IFS='|' read -r p h l e pa expected_env actual_env <<< "$status_line"
     printf '[%d/%d] %s  peppol=%s harmony=%s legalref=%s\n' "$idx" "$total" "$siren" "$p" "$h" "$l"
   done
 
-  local ok_count=0 ko_count=0 row _siren
+  local ok_count=0 mismatch_count=0 unverified_count=0 ko_count=0 row _siren
   for row in "${summary_rows[@]}"; do
-    IFS='|' read -r _siren p h l _ _ <<< "$row"
+    IFS='|' read -r _siren p h l _ _ _ _ <<< "$row"
     if [[ "$p" == 'OK' && "$h" == 'OK' && ( "$l" == 'OK' || "$l" == 'N/A' ) ]]; then
       ok_count=$((ok_count+1))
     else
       ko_count=$((ko_count+1))
     fi
+    [[ "$h" == 'MISMATCH' ]]   && mismatch_count=$((mismatch_count+1))
+    [[ "$h" == 'UNVERIFIED' ]] && unverified_count=$((unverified_count+1))
   done
 
   {
     printf "# Rapport ligne d'adressage\n\n"
     printf -- '- Date : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     printf -- '- Total SIRENs : %d\n' "$total"
-    printf -- '- Verts (3 checks OK) : %d\n' "$ok_count"
-    printf -- '- Avec au moins un KO : %d\n\n' "$ko_count"
+    printf -- '- Verts (3 checks OK + envId conforme) : %d\n' "$ok_count"
+    printf -- '- Harmony envId MISMATCH : %d\n' "$mismatch_count"
+    printf -- '- Harmony envId non verifie (mapping absent) : %d\n' "$unverified_count"
+    printf -- '- Avec au moins un KO/MISMATCH : %d\n\n' "$ko_count"
     printf '## Resume\n\n'
-    printf '| # | SIREN | Peppol | Harmony | LegalRef | ENV | PA |\n'
-    printf '|---|-------|--------|---------|----------|-----|----|\n'
+    printf '| # | SIREN | Peppol | Harmony | envId attendu | envId recu | LegalRef | ENV | PA |\n'
+    printf '|---|-------|--------|---------|---------------|------------|----------|-----|----|\n'
     idx=0
     for row in "${summary_rows[@]}"; do
       idx=$((idx+1))
-      IFS='|' read -r _siren p h l e pa <<< "$row"
-      printf '| %d | %s | %s | %s | %s | %s | %s |\n' \
-        "$idx" "$_siren" "$(status_icon "$p")" "$(status_icon "$h")" "$(status_icon "$l")" "$e" "$pa"
+      IFS='|' read -r _siren p h l e pa expected_env actual_env <<< "$row"
+      printf '| %d | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        "$idx" "$_siren" "$(status_icon "$p")" "$(status_icon "$h")" \
+        "${expected_env:--}" "${actual_env:--}" \
+        "$(status_icon "$l")" "$e" "$pa"
     done
     printf '\n## Details\n'
     cat "$details_tmp"
