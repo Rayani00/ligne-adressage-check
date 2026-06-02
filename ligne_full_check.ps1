@@ -8,10 +8,11 @@
 # Le check Harmony verifie aussi que l'environmentId renvoye par Harmony
 # correspond a celui attendu pour le client. Le mapping est compose a partir
 # de :
-#   - client-siren.csv (Env;Client;SIREN_TESTPILOTE)  -> SIREN -> Client
-#   - data.csv         (Client_name;Env;envId)        -> Client -> envId attendu
+#   - gis_siren_testpilote (env, client, siren_testpilote)  -> SIREN -> Client
+#   - gis_clients          (client_name, env, env_id)        -> Client -> envId attendu
+# Ces tables sont lues dans la base Neon (NEON_DATABASE_URL).
 # Si l'envId reel != envId attendu : Harmony = MISMATCH.
-# Si le mapping est incomplet (SIREN absent ou client absent de data.csv) :
+# Si le mapping est incomplet (SIREN absent ou client absent de gis_clients) :
 # Harmony = UNVERIFIED.
 #
 # Mode mono-SIREN (sortie console) :
@@ -188,7 +189,7 @@ function Get-CleanSiren {
     if ($t.StartsWith('#')) { return $null }
     # Strip trailing parenthesised label (ex : "... (Delpeyrat)")
     $t = $t -replace '\s*\([^)]*\)\s*$', ''
-    # Strip non-ASCII/control noise (cellules de client-siren.csv parfois corrompues)
+    # Strip non-ASCII/control noise (valeurs siren_testpilote parfois corrompues)
     $t = $t -replace '[^\x20-\x7E]', ''
     # Strip trailing non-alnum noise (?, ?? etc.)
     $t = $t -replace '[^A-Za-z0-9_]+$', ''
@@ -199,54 +200,62 @@ function Get-CleanSiren {
     return $null
 }
 
-# Charge data.csv (Client_name;Env;envId) et client-siren.csv (Env;Client;SIREN_TESTPILOTE)
-# et compose un map SIREN_SUFIX -> envId attendu (via le client).
-function Import-SirenMappings {
-    param([string]$ScriptDir)
+# Execute une requete SQL en lecture sur la base Neon via son endpoint HTTP /sql.
+# 100% natif (Invoke-RestMethod) : aucun client PostgreSQL ni driver requis.
+# Renvoie les lignes resultantes sous forme d'objets (proprietes = colonnes).
+function Invoke-NeonQuery {
+    param([string]$Sql, [object[]]$Params = @())
+    $cs = [Environment]::GetEnvironmentVariable('NEON_DATABASE_URL', 'Process')
+    if ([string]::IsNullOrWhiteSpace($cs)) { throw 'NEON_DATABASE_URL non definie' }
+    $uri      = [uri]$cs
+    $endpoint = "https://$($uri.Host)/sql"
+    $headers  = @{
+        'Neon-Connection-String' = $cs
+        'Neon-Array-Mode'        = 'false'
+    }
+    $body = @{ query = $Sql; params = $Params } | ConvertTo-Json -Compress
+    $resp = Invoke-RestMethod -Uri $endpoint -Method Post -ContentType 'application/json' `
+                              -Headers $headers -Body $body
+    return $resp.rows
+}
 
+# Charge gis_clients (client_name, env_id) et gis_siren_testpilote (client, siren_testpilote)
+# depuis la base Neon et compose un map SIREN_SUFIX -> envId attendu (via le client).
+function Import-SirenMappings {
     $cmp                  = [System.StringComparer]::OrdinalIgnoreCase
     $clientToEnvId        = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
     $sirenToClient        = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
     $sirenToExpectedEnvId = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
 
-    $dataPath = Join-Path $ScriptDir 'data.csv'
-    if (Test-Path -LiteralPath $dataPath) {
-        try {
-            $rows = Import-Csv -LiteralPath $dataPath -Delimiter ';'
-            foreach ($row in $rows) {
-                $client = if ($row.PSObject.Properties['Client_name']) { [string]$row.Client_name } else { '' }
-                $envId  = if ($row.PSObject.Properties['envId'])       { [string]$row.envId }       else { '' }
-                $client = ($client -replace '[^\x20-\x7E]', '').Trim()
-                $envId  = ($envId  -replace '[^\x20-\x7E]', '').Trim()
-                if ([string]::IsNullOrWhiteSpace($client) -or [string]::IsNullOrWhiteSpace($envId)) { continue }
-                if (-not $clientToEnvId.ContainsKey($client)) {
-                    $clientToEnvId[$client] = $envId
-                }
+    try {
+        $rows = Invoke-NeonQuery 'SELECT client_name, env_id FROM gis_clients'
+        foreach ($row in $rows) {
+            $client = ([string]$row.client_name -replace '[^\x20-\x7E]', '').Trim()
+            $envId  = ([string]$row.env_id      -replace '[^\x20-\x7E]', '').Trim()
+            if ([string]::IsNullOrWhiteSpace($client) -or [string]::IsNullOrWhiteSpace($envId)) { continue }
+            if (-not $clientToEnvId.ContainsKey($client)) {
+                $clientToEnvId[$client] = $envId
             }
-        } catch {
-            Write-Host "Avertissement : lecture de data.csv impossible ($($_.Exception.Message))" -ForegroundColor Yellow
         }
+    } catch {
+        Write-Host "Avertissement : lecture de gis_clients impossible ($($_.Exception.Message))" -ForegroundColor Yellow
     }
 
-    $clientSirenPath = Join-Path $ScriptDir 'client-siren.csv'
-    if (Test-Path -LiteralPath $clientSirenPath) {
-        try {
-            $rows = Import-Csv -LiteralPath $clientSirenPath -Delimiter ';'
-            foreach ($row in $rows) {
-                $client    = if ($row.PSObject.Properties['Client'])           { [string]$row.Client }           else { '' }
-                $sirenCell = if ($row.PSObject.Properties['SIREN_TESTPILOTE']) { [string]$row.SIREN_TESTPILOTE } else { '' }
-                $client    = ($client -replace '[^\x20-\x7E]', '').Trim()
-                if ([string]::IsNullOrWhiteSpace($client) -or [string]::IsNullOrWhiteSpace($sirenCell)) { continue }
-                foreach ($raw in ($sirenCell -split '[\r\n]+')) {
-                    $cleaned = Get-CleanSiren $raw
-                    if ($cleaned -and -not $sirenToClient.ContainsKey($cleaned)) {
-                        $sirenToClient[$cleaned] = $client
-                    }
+    try {
+        $rows = Invoke-NeonQuery 'SELECT client, siren_testpilote FROM gis_siren_testpilote'
+        foreach ($row in $rows) {
+            $client    = ([string]$row.client -replace '[^\x20-\x7E]', '').Trim()
+            $sirenCell = [string]$row.siren_testpilote
+            if ([string]::IsNullOrWhiteSpace($client) -or [string]::IsNullOrWhiteSpace($sirenCell)) { continue }
+            foreach ($raw in ($sirenCell -split '[\r\n]+')) {
+                $cleaned = Get-CleanSiren $raw
+                if ($cleaned -and -not $sirenToClient.ContainsKey($cleaned)) {
+                    $sirenToClient[$cleaned] = $client
                 }
             }
-        } catch {
-            Write-Host "Avertissement : lecture de client-siren.csv impossible ($($_.Exception.Message))" -ForegroundColor Yellow
         }
+    } catch {
+        Write-Host "Avertissement : lecture de gis_siren_testpilote impossible ($($_.Exception.Message))" -ForegroundColor Yellow
     }
 
     foreach ($siren in $sirenToClient.Keys) {
@@ -637,8 +646,8 @@ function Format-MarkdownReport {
             [void]$sb.AppendLine("")
             [void]$sb.AppendLine("**Harmony-connector** : $($r.Harmony.Status)")
             if ($r.Harmony.Url) { [void]$sb.AppendLine("- URL : $($r.Harmony.Url)") }
-            if ($r.Harmony.ExpectedClient) { [void]$sb.AppendLine("- Client attendu (client-siren.csv) : $($r.Harmony.ExpectedClient)") }
-            if ($r.Harmony.ExpectedEnvId)  { [void]$sb.AppendLine("- envId attendu (data.csv)         : $($r.Harmony.ExpectedEnvId)") }
+            if ($r.Harmony.ExpectedClient) { [void]$sb.AppendLine("- Client attendu (gis_siren_testpilote) : $($r.Harmony.ExpectedClient)") }
+            if ($r.Harmony.ExpectedEnvId)  { [void]$sb.AppendLine("- envId attendu (gis_clients)           : $($r.Harmony.ExpectedEnvId)") }
             if ($r.Harmony.ActualEnvId)    { [void]$sb.AppendLine("- envId recu (Harmony)             : $($r.Harmony.ActualEnvId)") }
             if ($r.Harmony.EnvIdCheck -and $r.Harmony.EnvIdCheck -ne 'NOT_RUN') {
                 [void]$sb.AppendLine("- Comparaison envId                : $($r.Harmony.EnvIdCheck)")
@@ -700,7 +709,8 @@ foreach ($v in @(
         'HARMONY_CONNECTOR_CLIENT_ID',
         'HARMONY_CONNECTOR_CLIENT_SECRET',
         'LEGALREF_CLIENT_ID',
-        'LEGALREF_CLIENT_SECRET')) {
+        'LEGALREF_CLIENT_SECRET',
+        'NEON_DATABASE_URL')) {
     if (-not [Environment]::GetEnvironmentVariable($v, 'Process')) {
         Write-Err "Variable d'environnement manquante : $v"
         Write-Host "Definissez-la dans script.env (meme dossier) ou dans l'environnement."
@@ -708,8 +718,8 @@ foreach ($v in @(
     }
 }
 
-# Mappings client-siren.csv + data.csv pour la verification de l'envId Harmony
-$Mappings = Import-SirenMappings -ScriptDir $ScriptDir
+# Mappings gis_clients + gis_siren_testpilote (base Neon) pour la verification de l'envId Harmony
+$Mappings = Import-SirenMappings
 
 function Get-ExpectedHarmonyContext {
     param([string]$Siren)
@@ -758,7 +768,7 @@ if (-not $BatchMode) {
         if ($r.Harmony.Status -eq 'MISMATCH') {
             Write-Err "Harmony envId MISMATCH pour `"0225:$Siren`" (client `"$($r.Harmony.ExpectedClient)`")`n       attendu : $($r.Harmony.ExpectedEnvId)`n       recu    : $($r.Harmony.ActualEnvId)"
         } elseif ($r.Harmony.Status -eq 'UNVERIFIED') {
-            Write-Log "# Harmony envId non verifie : SIREN `"$Siren`" absent de client-siren.csv ou client absent de data.csv"
+            Write-Log "# Harmony envId non verifie : SIREN `"$Siren`" absent de gis_siren_testpilote ou client absent de gis_clients"
         }
     }
 

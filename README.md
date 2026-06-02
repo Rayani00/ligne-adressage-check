@@ -22,16 +22,28 @@ Deux modes d'exécution :
 | `ligne_full_check.sh`   | Version Bash / Linux (requiert `curl`, `jq`, `base32`, `xmllint`, `openssl`, `dig`). Supporte le mode batch + rapport Markdown. |
 | `run.cmd`               | Lanceur Windows interactif pour le script PowerShell (mono-SIREN). |
 | `script.env.example`    | Modèle de configuration des secrets.                               |
-| `data.csv`              | Mapping `Client_name;Env;envId` — source de vérité de l'`envId` attendu par client. |
-| `client-siren.csv`      | Mapping `Env;Client;SIREN_TESTPILOTE` — relie chaque SIREN à un client de `data.csv`. |
+
+Les mappings client / SIREN sont lus dans une **base PostgreSQL Neon** (et non plus
+dans des fichiers CSV), via son endpoint HTTP `/sql` — aucun client PostgreSQL à
+installer. Tables attendues :
+
+| Table                  | Colonnes                              | Rôle |
+|------------------------|---------------------------------------|------|
+| `gis_clients`          | `client_name, env, env_id`            | `Client → envId` attendu |
+| `gis_siren_testpilote` | `env, client, siren_testpilote`       | `SIREN → Client` |
 
 ## Configuration
 
-Les scripts ont besoin de quatre secrets. Copiez le modèle et renseignez vos valeurs :
+Les scripts ont besoin de quatre secrets **plus** la chaîne de connexion Neon.
+Copiez le modèle et renseignez vos valeurs :
 
 ```sh
 cp script.env.example script.env
 ```
+
+Variables requises dans `script.env` : `HARMONY_CONNECTOR_CLIENT_ID`,
+`HARMONY_CONNECTOR_CLIENT_SECRET`, `LEGALREF_CLIENT_ID`, `LEGALREF_CLIENT_SECRET`
+et `NEON_DATABASE_URL` (chaîne `postgresql://user:password@host/db?...`).
 
 `script.env` est ignoré par git et ne doit **jamais** être committé. Les fichiers
 locaux `sirens.txt` et `rapport*.md` sont également exclus du dépôt
@@ -122,19 +134,19 @@ L'API Harmony peut renvoyer un routage **valide** (HTTP 200) mais pointant vers
 un **mauvais** `environmentId` (ex. routage créé par erreur dans un env voisin).
 Pour le détecter, le script confronte l'`environmentId` reçu à celui attendu :
 
-1. `client-siren.csv` (`Env;Client;SIREN_TESTPILOTE`) — chaque SIREN est associé
-   à un nom de client. Les cellules multi-lignes entre guillemets sont gérées.
-2. `data.csv` (`Client_name;Env;envId`) — chaque client a un `envId` cible.
+1. `gis_siren_testpilote` (`env, client, siren_testpilote`) — chaque SIREN est
+   associé à un nom de client.
+2. `gis_clients` (`client_name, env, env_id`) — chaque client a un `envId` cible.
 
 Statut Harmony résultant :
 
 - `OK` — API + `environmentId` reçu == `envId` attendu.
 - `MISMATCH` — API OK mais `environmentId` reçu != `envId` attendu.
 - `OK (?)` (`UNVERIFIED`) — API OK mais le mapping est incomplet (SIREN absent
-  de `client-siren.csv`, ou client absent de `data.csv`).
+  de `gis_siren_testpilote`, ou client absent de `gis_clients`).
 - `KO` (`ERROR`) — API en échec.
 
-Les deux CSV sont chargés au lancement du script ; aucune option à passer.
+Les deux tables sont chargées depuis Neon au lancement du script ; aucune option à passer.
 
 ### Contenu du rapport Markdown
 

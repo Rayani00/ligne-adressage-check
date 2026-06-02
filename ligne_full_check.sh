@@ -8,8 +8,9 @@
 # Le check Harmony verifie aussi que l'environmentId renvoye par Harmony
 # correspond a celui attendu pour le client. Le mapping est compose a partir
 # de :
-#   - client-siren.csv (Env;Client;SIREN_TESTPILOTE)  -> SIREN -> Client
-#   - data.csv         (Client_name;Env;envId)        -> Client -> envId attendu
+#   - gis_siren_testpilote (env, client, siren_testpilote)  -> SIREN -> Client
+#   - gis_clients          (client_name, env, env_id)        -> Client -> envId attendu
+#   (lus dans la base Neon via NEON_DATABASE_URL)
 # Si l'envId reel != envId attendu : Harmony = MISMATCH.
 # Si le mapping est incomplet : Harmony = UNVERIFIED.
 #
@@ -115,61 +116,56 @@ status_icon() {
   esac
 }
 
-# Parse data.csv (Client_name;Env;envId) -> stdout: "client|envid" lignes nettoyees.
-parse_data_csv() {
-  local file="$1"
-  [[ ! -f "$file" ]] && return 0
-  awk -F';' '
-    NR == 1 { next }
-    {
-      client = $1; envid = $3
-      gsub(/[^\x20-\x7E]/, "", client)
-      gsub(/[^\x20-\x7E]/, "", envid)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", client)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", envid)
-      if (client != "" && envid != "") print client "|" envid
-    }
-  ' "$file"
+# Execute une requete SQL en lecture sur la base Neon via son endpoint HTTP /sql.
+# $1 = requete SQL. Stdout : le JSON de reponse (champ .rows). Aucun client
+# PostgreSQL requis : curl + jq seulement (deja exiges par le script).
+neon_query() {
+  local sql="$1" host endpoint payload
+  host="$(printf '%s' "$NEON_DATABASE_URL" | sed -E 's#^[a-z]+://[^@]+@([^/?]+).*#\1#')"
+  endpoint="https://${host}/sql"
+  payload="$(jq -nc --arg q "$sql" '{query: $q, params: []}')"
+  curl -fsSX POST "$endpoint" \
+    -H 'Content-Type: application/json' \
+    -H "Neon-Connection-String: ${NEON_DATABASE_URL}" \
+    -H 'Neon-Array-Mode: false' \
+    -d "$payload"
 }
 
-# Parse client-siren.csv (Env;Client;SIREN_TESTPILOTE) en gerant les cellules
-# multi-lignes entre guillemets. Stdout : "client|siren_suffix" lignes nettoyees.
-parse_client_siren_csv() {
-  local file="$1"
-  [[ ! -f "$file" ]] && return 0
-  awk '
-    BEGIN { buf = ""; first = 1 }
-    {
-      buf = (buf == "" ? $0 : buf "\n" $0)
-      q = gsub(/"/, "&", buf)
-      if (q % 2 != 0) next
-      logical = buf
-      buf = ""
-      if (first) { first = 0; next }
+# Lit gis_clients depuis Neon. Stdout: "client|envid" lignes nettoyees.
+db_fetch_clients() {
+  neon_query 'SELECT client_name, env_id FROM gis_clients' \
+  | jq -r '.rows[] | [.client_name, .env_id] | @tsv' \
+  | awk -F'\t' '
+      {
+        client = $1; envid = $2
+        gsub(/[^\x20-\x7E]/, "", client)
+        gsub(/[^\x20-\x7E]/, "", envid)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", client)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", envid)
+        if (client != "" && envid != "") print client "|" envid
+      }'
+}
 
-      i1 = index(logical, ";")
-      if (i1 == 0) next
-      rest1 = substr(logical, i1 + 1)
-      i2 = index(rest1, ";")
-      if (i2 == 0) next
-      client = substr(rest1, 1, i2 - 1)
-      siren_cell = substr(rest1, i2 + 1)
-
-      gsub(/^"|"$/, "", siren_cell)
-      gsub(/[^\x20-\x7E]/, "", client)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", client)
-      if (client == "") next
-
-      n = split(siren_cell, sirens, /\n/)
-      for (k = 1; k <= n; k++) {
-        s = sirens[k]
-        gsub(/[^A-Za-z0-9_]/, "", s)
-        if (match(s, /^[0-9]{9,10}_/)) {
-          print client "|" s
+# Lit gis_siren_testpilote depuis Neon. Une valeur siren_testpilote peut contenir
+# plusieurs SIRENs (cellules multi-lignes historiques). Stdout : "client|siren_suffix".
+db_fetch_test_sirens() {
+  neon_query 'SELECT client, siren_testpilote FROM gis_siren_testpilote' \
+  | jq -r '.rows[] | [.client, (.siren_testpilote // "")] | @tsv' \
+  | awk -F'\t' '
+      {
+        client = $1; cell = $2
+        gsub(/[^\x20-\x7E]/, "", client)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", client)
+        if (client == "") next
+        n = split(cell, sirens, /\\n/)
+        for (k = 1; k <= n; k++) {
+          s = sirens[k]
+          gsub(/[^A-Za-z0-9_]/, "", s)
+          if (match(s, /^[0-9]{9,10}_/)) {
+            print client "|" s
+          }
         }
-      }
-    }
-  ' "$file"
+      }'
 }
 
 declare -A CLIENT_TO_ENVID
@@ -177,17 +173,16 @@ declare -A SIREN_TO_CLIENT
 declare -A SIREN_TO_EXPECTED_ENVID
 
 load_mappings() {
-  local dir="$1"
   local client envid siren
   while IFS='|' read -r client envid; do
     [[ -z "$client" || -z "$envid" ]] && continue
     [[ -z "${CLIENT_TO_ENVID[$client]:-}" ]] && CLIENT_TO_ENVID[$client]="$envid"
-  done < <(parse_data_csv "${dir}/data.csv")
+  done < <(db_fetch_clients)
 
   while IFS='|' read -r client siren; do
     [[ -z "$client" || -z "$siren" ]] && continue
     [[ -z "${SIREN_TO_CLIENT[$siren]:-}" ]] && SIREN_TO_CLIENT[$siren]="$client"
-  done < <(parse_client_siren_csv "${dir}/client-siren.csv")
+  done < <(db_fetch_test_sirens)
 
   for siren in "${!SIREN_TO_CLIENT[@]}"; do
     client="${SIREN_TO_CLIENT[$siren]}"
@@ -464,8 +459,8 @@ check_one_siren() {
         if [[ "$harmony_status" != 'NOT_RUN' ]]; then
           printf '\n**Harmony-connector** : %s\n' "$harmony_status"
           [[ -n "$harmony_connector_url" ]] && printf -- '- URL : %s\n' "$harmony_connector_url"
-          [[ -n "$expected_client" ]]      && printf -- '- Client attendu (client-siren.csv) : %s\n' "$expected_client"
-          [[ -n "$expected_env_id" ]]      && printf -- '- envId attendu (data.csv)         : %s\n' "$expected_env_id"
+          [[ -n "$expected_client" ]]      && printf -- '- Client attendu (gis_siren_testpilote) : %s\n' "$expected_client"
+          [[ -n "$expected_env_id" ]]      && printf -- '- envId attendu (gis_clients)           : %s\n' "$expected_env_id"
           [[ -n "$actual_env_id" ]]        && printf -- '- envId recu (Harmony)             : %s\n' "$actual_env_id"
           if [[ "$env_id_check" != 'NOT_RUN' ]]; then
             printf -- '- Comparaison envId                : %s\n' "$env_id_check"
@@ -527,7 +522,7 @@ check_one_siren() {
         if [[ "$harmony_status" == 'MISMATCH' ]]; then
           err "Harmony envId MISMATCH pour \"${participant}\" (client \"${expected_client}\")\n       attendu : ${expected_env_id}\n       recu    : ${actual_env_id}\n"
         elif [[ "$harmony_status" == 'UNVERIFIED' ]]; then
-          log "# Harmony envId non verifie : SIREN \"${siren}\" absent de client-siren.csv ou client absent de data.csv"
+          log "# Harmony envId non verifie : SIREN \"${siren}\" absent de gis_siren_testpilote ou client absent de gis_clients"
         fi
       fi
 
@@ -580,11 +575,11 @@ main() {
     command -v "$c" >/dev/null || { err "Missing required command: $c\n"; exit 1; }
   done
 
-  for v in HARMONY_CONNECTOR_CLIENT_ID HARMONY_CONNECTOR_CLIENT_SECRET LEGALREF_CLIENT_ID LEGALREF_CLIENT_SECRET; do
+  for v in HARMONY_CONNECTOR_CLIENT_ID HARMONY_CONNECTOR_CLIENT_SECRET LEGALREF_CLIENT_ID LEGALREF_CLIENT_SECRET NEON_DATABASE_URL; do
     [[ -z "${!v:-}" ]] && { err "Missing env var: $v\n  source ./script.env first, or define it in the environment.\n"; exit 1; }
   done
 
-  load_mappings "$script_dir"
+  load_mappings
 
   local batch_mode='false'
   if [[ -n "$INPUT_FILE" || -n "$OUTPUT_MARKDOWN" || -n "$SIRENS_CLI" ]]; then
