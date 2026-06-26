@@ -10,7 +10,7 @@
 # de :
 #   - gis_siren_testpilote (env, client, siren_testpilote)  -> SIREN -> Client
 #   - gis_clients          (client_name, env, env_id)        -> Client -> envId attendu
-#   (lus dans la base Neon via NEON_DATABASE_URL)
+#   (lus dans le fichier gis_mappings.json local (GIS_MAPPINGS_FILE))
 # Si l'envId reel != envId attendu : Harmony = MISMATCH.
 # Si le mapping est incomplet : Harmony = UNVERIFIED.
 #
@@ -117,9 +117,9 @@ status_icon() {
 }
 
 # Lit les mappings dans le fichier JSON local $GIS_MAPPINGS_FILE (défaut: à côté du script).
-# Émet la même forme {rows:[...]} que l'ancien endpoint Neon /sql, selon la table visée.
+# Émet la même forme {rows:[...]} que le fichier gis_mappings.json local, selon la table visée.
 neon_query() {
-  local sql="$1" file="${GIS_MAPPINGS_FILE:-$(dirname "$0")/gis_mappings.json}"
+  local sql="$1" file="${GIS_MAPPINGS_FILE:-$(dirname "${BASH_SOURCE[0]}")/gis_mappings.json}"
   [[ -f "$file" ]] || { err "GIS_MAPPINGS_FILE introuvable : $file\n"; return 1; }
   case "$sql" in
     *gis_siren_testpilote*) jq -c '{rows: (.gis_siren_testpilote // [])}' "$file" ;;
@@ -128,7 +128,7 @@ neon_query() {
   esac
 }
 
-# Lit gis_clients depuis Neon. Stdout: "client|envid" lignes nettoyees.
+# Lit gis_clients depuis le fichier gis_mappings.json local. Stdout: "client|envid" lignes nettoyees.
 db_fetch_clients() {
   neon_query 'SELECT client_name, env_id FROM gis_clients' \
   | jq -r '.rows[] | [.client_name, .env_id] | @tsv' \
@@ -143,7 +143,7 @@ db_fetch_clients() {
       }'
 }
 
-# Lit gis_siren_testpilote depuis Neon. Une valeur siren_testpilote peut contenir
+# Lit gis_siren_testpilote depuis le fichier gis_mappings.json local. Une valeur siren_testpilote peut contenir
 # plusieurs SIRENs (cellules multi-lignes historiques). Stdout : "client|siren_suffix".
 db_fetch_test_sirens() {
   neon_query 'SELECT client, siren_testpilote FROM gis_siren_testpilote' \

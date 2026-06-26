@@ -10,7 +10,7 @@
 # de :
 #   - gis_siren_testpilote (env, client, siren_testpilote)  -> SIREN -> Client
 #   - gis_clients          (client_name, env, env_id)        -> Client -> envId attendu
-# Ces tables sont lues dans la base Neon (NEON_DATABASE_URL).
+# Ces tables sont lues dans le fichier gis_mappings.json local (GIS_MAPPINGS_FILE).
 # Si l'envId reel != envId attendu : Harmony = MISMATCH.
 # Si le mapping est incomplet (SIREN absent ou client absent de gis_clients) :
 # Harmony = UNVERIFIED.
@@ -201,7 +201,7 @@ function Get-CleanSiren {
 }
 
 # Lit les mappings dans le fichier JSON local $env:GIS_MAPPINGS_FILE (défaut: à côté du script).
-# Renvoie les lignes (objets : propriétés = colonnes), comme l'ancien endpoint Neon.
+# Renvoie les lignes (objets : propriétés = colonnes), depuis le fichier gis_mappings.json local.
 function Invoke-NeonQuery {
     param([string]$Sql, [object[]]$Params = @())
     $file = $env:GIS_MAPPINGS_FILE
@@ -214,7 +214,7 @@ function Invoke-NeonQuery {
 }
 
 # Charge gis_clients (client_name, env_id) et gis_siren_testpilote (client, siren_testpilote)
-# depuis la base Neon et compose un map SIREN_SUFIX -> envId attendu (via le client).
+# depuis le fichier gis_mappings.json local et compose un map SIREN_SUFIX -> envId attendu (via le client).
 function Import-SirenMappings {
     $cmp                  = [System.StringComparer]::OrdinalIgnoreCase
     $clientToEnvId        = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
@@ -711,7 +711,7 @@ foreach ($v in @(
     }
 }
 
-# Mappings gis_clients + gis_siren_testpilote (base Neon) pour la verification de l'envId Harmony
+# Mappings gis_clients + gis_siren_testpilote (fichier gis_mappings.json local) pour la verification de l'envId Harmony
 $Mappings = Import-SirenMappings
 
 function Get-ExpectedHarmonyContext {
