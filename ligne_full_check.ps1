@@ -202,7 +202,7 @@ function Get-CleanSiren {
 
 # Lit les mappings dans le fichier JSON local $env:GIS_MAPPINGS_FILE (défaut: à côté du script).
 # Renvoie les lignes (objets : propriétés = colonnes), depuis le fichier gis_mappings.json local.
-function Invoke-NeonQuery {
+function Get-MappingRows {
     param([string]$Sql, [object[]]$Params = @())
     $file = $env:GIS_MAPPINGS_FILE
     if ([string]::IsNullOrWhiteSpace($file)) { $file = Join-Path $PSScriptRoot 'gis_mappings.json' }
@@ -222,7 +222,7 @@ function Import-SirenMappings {
     $sirenToExpectedEnvId = New-Object 'System.Collections.Generic.Dictionary[string,string]' $cmp
 
     try {
-        $rows = Invoke-NeonQuery 'SELECT client_name, env_id FROM gis_clients'
+        $rows = Get-MappingRows 'SELECT client_name, env_id FROM gis_clients'
         foreach ($row in $rows) {
             $client = ([string]$row.client_name -replace '[^\x20-\x7E]', '').Trim()
             $envId  = ([string]$row.env_id      -replace '[^\x20-\x7E]', '').Trim()
@@ -236,7 +236,7 @@ function Import-SirenMappings {
     }
 
     try {
-        $rows = Invoke-NeonQuery 'SELECT client, siren_testpilote FROM gis_siren_testpilote'
+        $rows = Get-MappingRows 'SELECT client, siren_testpilote FROM gis_siren_testpilote'
         foreach ($row in $rows) {
             $client    = ([string]$row.client -replace '[^\x20-\x7E]', '').Trim()
             $sirenCell = [string]$row.siren_testpilote

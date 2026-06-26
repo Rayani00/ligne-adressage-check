@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vérifie que la lecture locale produit les mêmes lignes que l'ancien chemin Neon.
+# Vérifie que la lecture locale produit les mêmes lignes que l'ancien chemin mappings.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -20,10 +20,10 @@ JSON
 export GIS_MAPPINGS_FILE="$TMP/gis_mappings.json"
 
 # Extrait les fonctions du script sans exécuter main (awk sur les 3 fonctions contiguës)
-source <(awk '/^neon_query\(\)/{f=1} f{print} f&&/^\}/{c++} c==3{exit}' ./ligne_full_check.sh)
+source <(awk '/^mappings_query\(\)/{f=1} f{print} f&&/^\}/{c++} c==3{exit}' ./ligne_full_check.sh)
 
-echo "Test 1: neon_query renvoie {rows} pour gis_clients"
-chk "$(neon_query 'SELECT client_name, env_id FROM gis_clients' | jq -r '.rows[0].client_name')" "acme" "client_name lu"
+echo "Test 1: mappings_query renvoie {rows} pour gis_clients"
+chk "$(mappings_query 'SELECT client_name, env_id FROM gis_clients' | jq -r '.rows[0].client_name')" "acme" "client_name lu"
 
 echo "Test 2: db_fetch_clients nettoie et filtre les lignes vides"
 chk "$(db_fetch_clients)" "acme|ACM_pre-acme" "une seule ligne client valide"

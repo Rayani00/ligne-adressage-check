@@ -118,7 +118,7 @@ status_icon() {
 
 # Lit les mappings dans le fichier JSON local $GIS_MAPPINGS_FILE (défaut: à côté du script).
 # Émet la même forme {rows:[...]} que le fichier gis_mappings.json local, selon la table visée.
-neon_query() {
+mappings_query() {
   local sql="$1" file="${GIS_MAPPINGS_FILE:-$(dirname "${BASH_SOURCE[0]}")/gis_mappings.json}"
   [[ -f "$file" ]] || { err "GIS_MAPPINGS_FILE introuvable : $file\n"; return 1; }
   case "$sql" in
@@ -130,7 +130,7 @@ neon_query() {
 
 # Lit gis_clients depuis le fichier gis_mappings.json local. Stdout: "client|envid" lignes nettoyees.
 db_fetch_clients() {
-  neon_query 'SELECT client_name, env_id FROM gis_clients' \
+  mappings_query 'SELECT client_name, env_id FROM gis_clients' \
   | jq -r '.rows[] | [.client_name, .env_id] | @tsv' \
   | awk -F'\t' '
       {
@@ -146,7 +146,7 @@ db_fetch_clients() {
 # Lit gis_siren_testpilote depuis le fichier gis_mappings.json local. Une valeur siren_testpilote peut contenir
 # plusieurs SIRENs (cellules multi-lignes historiques). Stdout : "client|siren_suffix".
 db_fetch_test_sirens() {
-  neon_query 'SELECT client, siren_testpilote FROM gis_siren_testpilote' \
+  mappings_query 'SELECT client, siren_testpilote FROM gis_siren_testpilote' \
   | jq -r '.rows[] | [.client, (.siren_testpilote // "")] | @tsv' \
   | awk -F'\t' '
       {

@@ -12,4 +12,5 @@ rapport.md
 rapport_*.md
 client.csv
 test_siren.csv
+# Mappings client/SIREN réels (547 clients) — JAMAIS sur ce dépôt public ; reste local
 gis_mappings.json
