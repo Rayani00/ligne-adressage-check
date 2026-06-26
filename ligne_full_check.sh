@@ -116,19 +116,16 @@ status_icon() {
   esac
 }
 
-# Execute une requete SQL en lecture sur la base Neon via son endpoint HTTP /sql.
-# $1 = requete SQL. Stdout : le JSON de reponse (champ .rows). Aucun client
-# PostgreSQL requis : curl + jq seulement (deja exiges par le script).
+# Lit les mappings dans le fichier JSON local $GIS_MAPPINGS_FILE (défaut: à côté du script).
+# Émet la même forme {rows:[...]} que l'ancien endpoint Neon /sql, selon la table visée.
 neon_query() {
-  local sql="$1" host endpoint payload
-  host="$(printf '%s' "$NEON_DATABASE_URL" | sed -E 's#^[a-z]+://[^@]+@([^/?]+).*#\1#')"
-  endpoint="https://${host}/sql"
-  payload="$(jq -nc --arg q "$sql" '{query: $q, params: []}')"
-  curl -fsSX POST "$endpoint" \
-    -H 'Content-Type: application/json' \
-    -H "Neon-Connection-String: ${NEON_DATABASE_URL}" \
-    -H 'Neon-Array-Mode: false' \
-    -d "$payload"
+  local sql="$1" file="${GIS_MAPPINGS_FILE:-$(dirname "$0")/gis_mappings.json}"
+  [[ -f "$file" ]] || { err "GIS_MAPPINGS_FILE introuvable : $file\n"; return 1; }
+  case "$sql" in
+    *gis_siren_testpilote*) jq -c '{rows: (.gis_siren_testpilote // [])}' "$file" ;;
+    *gis_clients*)          jq -c '{rows: (.gis_clients // [])}'          "$file" ;;
+    *)                      printf '{"rows":[]}\n' ;;
+  esac
 }
 
 # Lit gis_clients depuis Neon. Stdout: "client|envid" lignes nettoyees.
@@ -575,7 +572,7 @@ main() {
     command -v "$c" >/dev/null || { err "Missing required command: $c\n"; exit 1; }
   done
 
-  for v in HARMONY_CONNECTOR_CLIENT_ID HARMONY_CONNECTOR_CLIENT_SECRET LEGALREF_CLIENT_ID LEGALREF_CLIENT_SECRET NEON_DATABASE_URL; do
+  for v in HARMONY_CONNECTOR_CLIENT_ID HARMONY_CONNECTOR_CLIENT_SECRET LEGALREF_CLIENT_ID LEGALREF_CLIENT_SECRET; do
     [[ -z "${!v:-}" ]] && { err "Missing env var: $v\n  source ./script.env first, or define it in the environment.\n"; exit 1; }
   done
 
