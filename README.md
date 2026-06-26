@@ -23,9 +23,7 @@ Deux modes d'exécution :
 | `run.cmd`               | Lanceur Windows interactif pour le script PowerShell (mono-SIREN). |
 | `script.env.example`    | Modèle de configuration des secrets.                               |
 
-Les mappings client / SIREN sont lus dans une **base PostgreSQL Neon** (et non plus
-dans des fichiers CSV), via son endpoint HTTP `/sql` — aucun client PostgreSQL à
-installer. Tables attendues :
+Les mappings client / SIREN sont lus dans un fichier `gis_mappings.json` local (chemin via `GIS_MAPPINGS_FILE`, défaut à côté du script). Tables attendues :
 
 | Table                  | Colonnes                              | Rôle |
 |------------------------|---------------------------------------|------|
@@ -34,7 +32,7 @@ installer. Tables attendues :
 
 ## Configuration
 
-Les scripts ont besoin de quatre secrets **plus** la chaîne de connexion Neon.
+Les scripts ont besoin de quatre secrets **plus** le chemin du fichier de mappings.
 Copiez le modèle et renseignez vos valeurs :
 
 ```sh
@@ -43,7 +41,7 @@ cp script.env.example script.env
 
 Variables requises dans `script.env` : `HARMONY_CONNECTOR_CLIENT_ID`,
 `HARMONY_CONNECTOR_CLIENT_SECRET`, `LEGALREF_CLIENT_ID`, `LEGALREF_CLIENT_SECRET`
-et `NEON_DATABASE_URL` (chaîne `postgresql://user:password@host/db?...`).
+et `GIS_MAPPINGS_FILE` (chemin vers `gis_mappings.json` ; défaut : `gis_mappings.json` à côté du script).
 
 `script.env` est ignoré par git et ne doit **jamais** être committé. Les fichiers
 locaux `sirens.txt` et `rapport*.md` sont également exclus du dépôt
@@ -146,7 +144,7 @@ Statut Harmony résultant :
   de `gis_siren_testpilote`, ou client absent de `gis_clients`).
 - `KO` (`ERROR`) — API en échec.
 
-Les deux tables sont chargées depuis Neon au lancement du script ; aucune option à passer.
+Les deux tables sont chargées depuis `gis_mappings.json` au lancement du script ; aucune option à passer.
 
 ### Contenu du rapport Markdown
 
