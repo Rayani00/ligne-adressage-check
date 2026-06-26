@@ -200,23 +200,17 @@ function Get-CleanSiren {
     return $null
 }
 
-# Execute une requete SQL en lecture sur la base Neon via son endpoint HTTP /sql.
-# 100% natif (Invoke-RestMethod) : aucun client PostgreSQL ni driver requis.
-# Renvoie les lignes resultantes sous forme d'objets (proprietes = colonnes).
+# Lit les mappings dans le fichier JSON local $env:GIS_MAPPINGS_FILE (défaut: à côté du script).
+# Renvoie les lignes (objets : propriétés = colonnes), comme l'ancien endpoint Neon.
 function Invoke-NeonQuery {
     param([string]$Sql, [object[]]$Params = @())
-    $cs = [Environment]::GetEnvironmentVariable('NEON_DATABASE_URL', 'Process')
-    if ([string]::IsNullOrWhiteSpace($cs)) { throw 'NEON_DATABASE_URL non definie' }
-    $uri      = [uri]$cs
-    $endpoint = "https://$($uri.Host)/sql"
-    $headers  = @{
-        'Neon-Connection-String' = $cs
-        'Neon-Array-Mode'        = 'false'
-    }
-    $body = @{ query = $Sql; params = $Params } | ConvertTo-Json -Compress
-    $resp = Invoke-RestMethod -Uri $endpoint -Method Post -ContentType 'application/json' `
-                              -Headers $headers -Body $body
-    return $resp.rows
+    $file = $env:GIS_MAPPINGS_FILE
+    if ([string]::IsNullOrWhiteSpace($file)) { $file = Join-Path $PSScriptRoot 'gis_mappings.json' }
+    if (-not (Test-Path $file)) { throw "GIS_MAPPINGS_FILE introuvable : $file" }
+    $data = Get-Content -Raw -Path $file | ConvertFrom-Json
+    if ($Sql -match 'gis_siren_testpilote') { return @($data.gis_siren_testpilote) }
+    elseif ($Sql -match 'gis_clients')      { return @($data.gis_clients) }
+    return @()
 }
 
 # Charge gis_clients (client_name, env_id) et gis_siren_testpilote (client, siren_testpilote)
@@ -709,8 +703,7 @@ foreach ($v in @(
         'HARMONY_CONNECTOR_CLIENT_ID',
         'HARMONY_CONNECTOR_CLIENT_SECRET',
         'LEGALREF_CLIENT_ID',
-        'LEGALREF_CLIENT_SECRET',
-        'NEON_DATABASE_URL')) {
+        'LEGALREF_CLIENT_SECRET')) {
     if (-not [Environment]::GetEnvironmentVariable($v, 'Process')) {
         Write-Err "Variable d'environnement manquante : $v"
         Write-Host "Definissez-la dans script.env (meme dossier) ou dans l'environnement."
