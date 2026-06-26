@@ -1,0 +1,8 @@
+{
+  "gis_clients": [
+    { "client_name": "exemple", "env_id": "EXA_pre-exemple" }
+  ],
+  "gis_siren_testpilote": [
+    { "client": "exemple", "siren_testpilote": "123456789_TESTPILOTE" }
+  ]
+}
