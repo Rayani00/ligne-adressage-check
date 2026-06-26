@@ -16,8 +16,10 @@ neon() {
     -d "$(jq -nc --arg q "$1" '{query:$q, params:[]}')"
 }
 
-clients="$(neon 'SELECT client_name, env_id FROM gis_clients' | jq '.rows')"
-sirens="$(neon 'SELECT client, siren_testpilote FROM gis_siren_testpilote' | jq '.rows')"
-jq -n --argjson c "$clients" --argjson s "$sirens" \
-  '{gis_clients: $c, gis_siren_testpilote: $s}' > "$out"
+clients_file="$(mktemp)"; sirens_file="$(mktemp)"
+trap 'rm -f "$clients_file" "$sirens_file"' EXIT
+neon 'SELECT client_name, env_id FROM gis_clients'              | jq '.rows' > "$clients_file"
+neon 'SELECT client, siren_testpilote FROM gis_siren_testpilote' | jq '.rows' > "$sirens_file"
+jq -n --slurpfile c "$clients_file" --slurpfile s "$sirens_file" \
+  '{gis_clients: $c[0], gis_siren_testpilote: $s[0]}' > "$out"
 echo "Écrit $out : $(jq '.gis_clients|length' "$out") clients, $(jq '.gis_siren_testpilote|length' "$out") lignes siren."
